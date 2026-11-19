@@ -1,6 +1,7 @@
 ---
 name: aicoder-code-review
 description: Use when the user asks to review code, audit a diff or recent changes, check code quality before commit, or review AI-generated code against project conventions; also for follow-up review rounds (复审/复查/第二轮/修复后再看/再审一遍), registering review decisions (某条不修/已修好), or querying past findings (遗留问题/上次报了什么). Triggers include: 代码审查、代码评审、review 一下、帮我看看这段代码、提交前检查、审查 AI 生成的代码、检查这次改动、检查是否违反项目惯例/约定、复审、遗留问题. Covers Java/Spring, Vue and JavaScript/TypeScript projects.
+allowed-tools: Read, Bash, Edit, Write, Grep, Agent, Glob
 ---
 
 # AICoder Code Review
@@ -19,9 +20,15 @@ description: Use when the user asks to review code, audit a diff or recent chang
 
 ## 工作流
 
-1. **确定范围与派发方式**：读 `.aicoder/code-review/config.yaml`（不存在则全默认）。用户指定文件/粘贴代码 → 直接以之为范围，不跑 git diff；未指定的"本次改动" → `git diff --stat` + 总行数确定变更文件与行数。**一律派发子代理，不分首轮/跟进轮、不分行数；行数只决定分块策略：`git diff` 总行数 ≤ 150 行 → 单块派发，> 150 行 → 按功能内聚分块。禁止直跑（不允许主会话自行审查）**。审查阶段**不读** `review.md` / `lessons.md`（含历史项、决策、惯例）——它们只在写回阶段按需读取，详见第 4 步。
-2. **派发分析**：完整读取 `assets/subagent-dispatch.md`，按其构造子代理任务并派发（diff 小就单块派发，但仍必须走子代理）。三个要点：① 主会话读一次 config 与清单，提炼成"执行要点"**内联进 prompt**，子代理不再各自读清单文件；② 历史包收敛为**共享片段**（惯例缓存 + 决策口径写一份，各 prompt 引用同一份，各块只附本块邻接摘要）；③ 子代理发现**不带行号**，只给逐字代码 + 相对路径 + 可定位文案，行号由主会话统一解析。接收结构化发现后主会话对账合并（同文件同语义）。
-3. **输出报告**：完整读取 `assets/report-generation.md` 生成报告并展示。**主会话用 grep 统一解析每条发现的真实行号**填入引用块，再抽查 1-2 条逐字代码与文件一致，不一致整批退回。默认不写"修复确认"（见"复核场景"）。
+1. **写分块 spec**：
+
+!`git diff --stat 2>/dev/null || printf '(no git diff)\n'`
+
+!`printf 'UNTRACKED:\n'; git status --short 2>/dev/null || printf '(none)\n'`
+
+按功能内聚把变更文件分成块，写 spec JSON（每块 id + files + 有交互关系的块摘要）。≤500 行单块，>500 行分块（上限 4 块）。**一律派发子代理，禁止直跑**。不读 review.md/lessons.md（只在写回阶段读）。
+2. **准备 + 派发（脚本）**：调用 `scripts/repo_prep.js <项目根> <skill根> <spec文件>`——脚本读 config/清单/lessons/diff，**拼装 N 份完整 prompt 到 `tmp/review-prompts/fN.md`**，主会话不经手正文（token≈0）。manifest 重定向到文件再 Read（规避 Bash VT 伪影）。**manifest 自带各块 `lines`/`diffHunks`/`diffEmpty`，据此确认产物即可，不再额外 `wc -l`/`grep` 校验**。按 manifest **一条消息并行派发** N 个子代理，每个只传"用 Read 读取 fN.md 并严格遵守"。子代理发现不带行号、用轻量标记文本。接收后主会话对账合并（同文件同语义）。派发规范见 `assets/subagent-dispatch.md`。
+3. **行号解析 + 报告（脚本）**：把合并发现的可定位符号写成 JSON，调用 `scripts/resolve_lines.js` 批量解析行号；再调用 `scripts/render_report.js <标记文本>` 生成 markdown 报告（stdout 或文件）。**报告须正文呈现**：主会话读报告原文原样输出。默认不写"修复确认"（见"复核场景"）。格式规则已内置脚本，`assets/report-generation.md` 只留判定口径与脚本接口。
 4. **写回状态**：读 `review.md` 最新内容（定轮次号 + 防并行覆盖），本轮发现并入被接续的主条目（禁止并列/空条目），全终态压缩为存根（决策明细行保留）；lessons 新模式/新决策/新惯例入册；遵守容量与老化规则。此阶段才读 `lessons.md` 提炼惯例增量。
 
 ## 复核场景（暂未启用，后续单独添加）
@@ -39,15 +46,10 @@ description: Use when the user asks to review code, audit a diff or recent chang
 
 ## 常见错误（高频红牌）
 
-| 错误 | 纠正 |
-|------|------|
-| 凭印象写问题，不验证逐字代码 | 打开文件确认后才能写入报告 |
-| 没读 report-generation.md 就写报告 | 写报告前必须完整读取该模块 |
-| 先读清单、后读配置（或配置关了还读清单） | 必须先读 `.aicoder/code-review/config.yaml` 再加载清单；开关为 false 的清单禁止读取 |
-| 指定文件审查时先跑 git diff | 指定文件就直接读；diff 只用于未指定文件的变更审查 |
-| 直接采信子代理返回的行号 | 子代理不带行号；主会话用 grep 统一解析真实行号后填入引用块 |
-| 子代理各自重复读清单文件 | 主会话读一次提炼执行要点内联进 prompt |
-| 审查阶段读 review.md/lessons.md 做历史项核实 | 默认不复核，这两份文件只在写回阶段按需读取 |
-| 写回时凭上下文里的旧 log 直接追加或另开条目 | 写回前重读 review.md 最新内容；同变更全部并入主条目 |
-| 把 lint 能查的格式问题写进报告 | 直接跳过 |
-| 审查过程中编译代码或运行测试 | **纯静态分析红线**：禁止任何编译/测试/写操作；动态验证先征询用户同意 |
+- **纯静态红线**：禁止编译/测试/写操作；动态验证先征询用户
+- 凭印象写问题 → 必须打开文件验证逐字代码与行号后才写入
+- 采信子代理返回的行号 → 子代理不带行号，由 `resolve_lines.js` 批量解析后填入
+- 直接解析脚本 stdout → 重定向到文件再 Read（Bash stdout 有 VT 伪影）
+- 审查阶段读 review.md/lessons.md 做核实 → 默认不复核，这两份只在写回阶段按需读
+- 写回时凭旧 log 追加或另开条目 → 写回前重读最新 review.md，同变更并入主条目
+- lint 能查的格式问题 → 直接跳过
