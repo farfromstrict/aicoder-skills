@@ -63,6 +63,8 @@ function loadRules(file, fallback) {
       deny: Array.isArray(p.deny) ? p.deny : [],
       ask: Array.isArray(p.ask) ? p.ask : [],
       allow: Array.isArray(p.allow) ? p.allow : (fallback || FALLBACK_ALLOW),
+      write_allow: Array.isArray(p.write_allow) ? p.write_allow : [],
+      delete_allow: Array.isArray(p.delete_allow) ? p.delete_allow : [],
     };
     // --rules 在下面独立构造用户层，不经过这里
     return layer;
@@ -208,10 +210,6 @@ try {
 
 const command = input?.tool_input?.command ?? input?.command ?? '';
 const rawCmd = typeof command === 'string' ? command.trim() : '';
-// 预处理链：解封装 → 变量解析（$p=... 替换） → 剥离无害输出重定向（>/dev/null、Out-File 到 Temp）
-let cmd = unwrapShell(rawCmd);
-cmd = resolveVars(cmd);
-cmd = stripHarmlessRedir(cmd);
 
 // --rules 重放：直接用日志里的命中项构造用户层，完全不依赖 permission.json
 let userLayer;
@@ -222,27 +220,32 @@ if (RULES_OVERRIDE) {
     userLayer = {
       mode: ["allow-all", "no-ask", "normal"].includes(MODE_OVERRIDE) ? MODE_OVERRIDE : 'normal',
       deny: norm('deny'), ask: norm('ask'), allow: norm('allow'),
+      write_allow: norm('write_allow'), delete_allow: norm('delete_allow'),
     };
   } catch {
-    userLayer = { mode: 'normal', deny: [], ask: [], allow: FALLBACK_ALLOW };
+    userLayer = { mode: 'normal', deny: [], ask: [], allow: FALLBACK_ALLOW, write_allow: [], delete_allow: [] };
   }
 } else {
-  userLayer = loadRules(USER_CONFIG, FALLBACK_ALLOW) || { mode: 'normal', deny: [], ask: [], allow: FALLBACK_ALLOW };
+  userLayer = loadRules(USER_CONFIG, FALLBACK_ALLOW) || { mode: 'normal', deny: [], ask: [], allow: FALLBACK_ALLOW, write_allow: [], delete_allow: [] };
 }
 const pDir = process.env.CODEBUDDY_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || '';
 const projLayer = pDir ? loadRules(join(pDir, '.codebuddy', 'permission.json')) : null;
 const denyRules = compile(userLayer.deny);
 const askRules = compile(userLayer.ask);
 const allowRules = compile(userLayer.allow);
+const writeRules = compile(userLayer.write_allow);
+const deleteRules = compile(userLayer.delete_allow);
 const projDeny = projLayer ? compile(projLayer.deny) : [];
 const projAsk = projLayer ? compile(projLayer.ask) : [];
 const projAllow = projLayer ? compile(projLayer.allow) : [];
+const projWrite = projLayer ? compile(projLayer.write_allow) : [];
+const projDelete = projLayer ? compile(projLayer.delete_allow) : [];
 
 
 
 
 // 命中的规则（去重，按文本），供决策日志与 --rules 重放使用
-const hit = { deny: new Set(), ask: new Set(), allow: new Set() };
+const hit = { deny: new Set(), ask: new Set(), allow: new Set(), write_allow: new Set(), delete_allow: new Set() };
 function trackHit(kind, rule) {
   if (rule && hit[kind]) hit[kind].add(rule);
 }
@@ -251,6 +254,8 @@ function hitRules() {
     deny: [...hit.deny],
     ask: [...hit.ask],
     allow: [...hit.allow],
+    write_allow: [...hit.write_allow],
+    delete_allow: [...hit.delete_allow],
   };
 }
 
@@ -305,6 +310,11 @@ function decision(level, reasonCode, reasonText) {
   process.stdout.write(json);
 }
 
+// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 按 write_allow 剥离无害写重定向
+let cmd = unwrapShell(rawCmd);
+cmd = resolveVars(cmd);
+cmd = stripHarmlessRedir(cmd);
+
 if (userLayer.mode === 'allow-all') {
   decision('allow', REASON.ALLOW_MODE_ALL, '✅ mode=allow-all：全部放行');
   process.exit(0);
@@ -332,24 +342,42 @@ if (userLayer.mode === 'no-ask' || (projLayer && projLayer.mode === 'no-ask')) {
   decision('allow', REASON.ALLOW_MODE_NOASK, '✅ mode=no-ask：未命中 deny 规则，放行');
   process.exit(0);
 }
-// 剥离无害的输出丢弃型重定向：
-//   fd 复制 2>&1 / >&2；写到 /dev/null；Out-File 到临时目录（输出暂存再读回，无实际副作用）。
-// 真正写到其他文件的 > / >> / Out-File 保留，仍会被运算符检查拦下。
+// 提取段中的写入目标路径：> / >> / Out-File -FilePath。返回 { target, rest } 或 null。
+function extractWriteTarget(seg) {
+  let m = seg.match(/\|?\s*Out-File\s+-FilePath\s+(['"])([^'"]+)\1/i);
+  if (m) return { target: m[2], re: /\|?\s*Out-File\s+-FilePath\s+(['"])([^'"]+)\1(\s+-Encoding\s+\S+)?/gi };
+  m = seg.match(/>>?\s+['"]?([^'">|;]+)['"]?\s*$/);
+  if (m) return { target: m[1].trim(), re: />>?\s+['"]?([^'">|;]+)['"]?\s*$/g };
+  return null;
+}
+
+// 提取段中的删除目标路径：rm [-f...] / Remove-Item。返回 { target, re } 或 null。
+function extractDeleteTarget(seg) {
+  let m = seg.match(/^rm\s+(?:-[a-z]+(?::\S+)?\s+)*['"]?([^'">|;]+?)['"]?(?:\s+-[a-z]+(?::\S+)?)?\s*$/i);
+  if (m) return { target: m[1].trim(), re: /^rm\s+.*$/i };
+  m = seg.match(/^Remove-Item\s+(?:-[a-z]+(?::\S+)?\s+)*['"]?([^'">|;]+?)['"]?(?:\s+-[a-z]+(?::\S+)?)?\s*$/i);
+  if (m) return { target: m[1].trim(), re: /^Remove-Item\s+.*$/i };
+  return null;
+}
+
+// 剥离无害的输出重定向：
+//   fd 复制 2>&1 />&2、写 /dev/null → 直接剥离；
+//   写目标命中 write_allow（如 Temp）→ 剥离该重定向，记入 hit_rules.write_allow。
+// 真正写其他文件的 > / >> 保留，仍被运算符检查拦下。
 function stripHarmlessRedir(s) {
   let r = s
     .replace(/[12]?>\s*&\s*[12]\b/g, '')
     .replace(/&>\s*\/dev\/null\b/g, '')
     .replace(/[12]?>\s*\/dev\/null\b/g, '');
-  // | Out-File -FilePath "<Temp路径>" [-Encoding utf8] → 整段剥离（Temp 目录视为输出暂存）
-  r = r.replace(/\|?\s*Out-File\s+-FilePath\s+['"]([^'"]*\b(?:Temp|TEMP|tmp)\b[^'"]*)['"](\s+-Encoding\s+\S+)?/gi, (_, p) => {
-    return isTempPath(p) ? '' : _; // 非 Temp 路径保留
-  });
+  // 逐段处理写重定向（> / >>），命中 write_allow 才剥离
+  r = splitSegments(r).map(seg => {
+    const wt = extractWriteTarget(seg);
+    if (!wt) return seg;
+    const m = firstMatch(projWrite, wt.target) || firstMatch(writeRules, wt.target);
+    if (m) { trackHit('write_allow', m.rule); return seg.replace(wt.re, ''); }
+    return seg;
+  }).join('; ');
   return r;
-}
-
-// 路径是否位于临时目录（Out-File 无害判定）
-function isTempPath(p) {
-  return /[/\\](Temp|TEMP|tmp)[/\\]/i.test(p) || /^[/\\]tmp[/\\]/i.test(p);
 }
 
 // 1. 管道/重定向/反引号/命令替换/单 & 调用操作符 → ask（按运算符类型细分 reason）
@@ -388,6 +416,12 @@ const results = segs.map((seg, i) => {
   const d = firstMatch(denyRules, seg);
   if (d) return { kind: 'deny', seg, i, rule: d.rule };
   if (isSafeSegment(seg)) return { kind: 'safe', seg, i };
+  // 删除目标命中 delete_allow（如 Temp）→ safe
+  const dt = extractDeleteTarget(seg);
+  if (dt) {
+    const dm = firstMatch(projDelete, dt.target) || firstMatch(deleteRules, dt.target);
+    if (dm) return { kind: 'safe', seg, i, dmRule: dm.rule };
+  }
   const a = firstMatch(askRules, seg);
   if (a) return { kind: 'ask', seg, i, rule: a.rule };
   const w = firstMatch(allowRules, seg);
@@ -399,6 +433,7 @@ const results = segs.map((seg, i) => {
 // 收集逐段命中的规则（去重由 trackHit 内部 Set 完成）
 for (const r of results) {
   if (r.rule) trackHit(r.kind === 'allow' ? 'allow' : r.kind, r.rule);
+  if (r.dmRule) trackHit('delete_allow', r.dmRule);
 }
 
 // 4. 任一段命中 deny → 拦截并指出所在段
