@@ -493,16 +493,21 @@ function splitPipes(cmd) {
   return parts.map(s => s.trim()).filter(Boolean);
 }
 
-// 安全管道归一化：把含 | 的命令按 | 和 ; 拆段，若所有段都安全，则把 | 当 ; 放行；
-// 否则保留 |，让下面的运算符检查拦下。这样只读过滤链（grep|head、Get-Content|ConvertFrom-Json）可自动通过。
+// 安全管道归一化：按 ; 拆段后逐段处理。每个含 | 的段，若其所有管道子段都安全，
+// 则把该段的 | 当 ; 归一化；否则原样保留该段。这样一条命令里"安全管道段"和"不安全段"
+// 互不拖累——例如 `ls a | grep x; rm -f f` 只归一化前者，rm 段保留由逐段分类处理。
 function normalizeSafePipes(s) {
-  if (!s.includes('|') || s.includes('||')) return s;
-  const parts = splitPipes(s).flatMap(p => splitSegments(p)).filter(Boolean);
-  if (parts.length && parts.every(isSegSafe)) {
-    // 归一化后剥掉段首调用操作符 &，避免残留 & 触发 EXTERNAL_CALL 检查
-    return parts.map(p => p.replace(/^&\s+/, '').trim()).join('; ');
-  }
-  return s;
+  if (!s.includes('|')) return s;
+  const segs = splitSegments(s);
+  return segs.map(seg => {
+    if (!seg.includes('|') || seg.includes('||')) return seg;
+    const parts = splitPipes(seg).filter(Boolean);
+    if (parts.length > 1 && parts.every(isSegSafe)) {
+      // 归一化后剥掉段首调用操作符 &，避免残留 & 触发 EXTERNAL_CALL 检查
+      return parts.map(p => p.replace(/^&\s+/, '').trim()).join('; ');
+    }
+    return seg;
+  }).join('; ');
 }
 
 // 1. 复杂结构优先判定 → ask。带 {} 脚本块/控制流的命令，本质是"无法可靠分析"，
