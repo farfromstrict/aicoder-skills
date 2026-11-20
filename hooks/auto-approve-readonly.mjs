@@ -125,6 +125,27 @@ function unwrapShell(input, depth = 0) {
   return out.join('; ');
 }
 
+// 变量解析：收集 $var = "字面量" 赋值，替换后续段中的 $var 引用。
+// 仅处理简单字面量赋值（无副作用），不解析表达式/命令替换。
+function resolveVars(cmd) {
+  const segs = splitSegments(cmd);
+  const vars = new Map();
+  const out = [];
+  for (const seg of segs) {
+    const m = seg.match(/^\$([A-Za-z_]\w*)\s*=\s*(['"])(.*?)\2\s*$/);
+    if (m) {
+      vars.set(m[1], m[2] + m[3] + m[2]); // 保留引号，如 "C:\...\herdr-app.exe"
+      continue; // 赋值段本身仍保留，交给 isSafeSegment 判定
+    }
+    let resolved = seg;
+    for (const [name, value] of vars) {
+      resolved = resolved.replace(new RegExp('\\$' + name + '\\b', 'g'), value);
+    }
+    out.push(resolved);
+  }
+  return out.join('; ');
+}
+
 // 安全段：切换目录 / 设置环境变量（无副作用；$env: 排除 PATH/GIT_ 开头/PSModulePath 等敏感变量）
 function isSafeSegment(seg) {
   const cdRe = /^(cd|Set-Location|sl)\s+\S/;
@@ -132,7 +153,11 @@ function isSafeSegment(seg) {
   const exportRe = /^export\s+(?!PATH\b|PSModulePath\b|GIT_)[A-Za-z_]\w*=/;
   // bash 普通变量赋值（S="..." / TMP=...）：无副作用，与 $env:/export 同等对待并排除敏感名
   const bashVarRe = /^(?!PATH\b|PSModulePath\b|GIT_)[A-Za-z_]\w*\s*=/;
-  return cdRe.test(seg) || envRe.test(seg) || exportRe.test(seg) || bashVarRe.test(seg);
+  // PowerShell 变量赋值（$p = "..."）：无副作用的字面量赋值
+  const psVarRe = /^\$[A-Za-z_]\w*\s*=\s*['"][^'"]*['"]$/;
+  // PowerShell 只读查看命令（Out-File 剥离后用于读回临时文件）
+  const psReadRe = /^(Get-Content|Select-String|ConvertFrom-Json|Out-String|Sort-Object|Format-List|Format-Table)\b/i;
+  return cdRe.test(seg) || envRe.test(seg) || exportRe.test(seg) || bashVarRe.test(seg) || psVarRe.test(seg) || psReadRe.test(seg);
 }
 
 // 引号感知拆段：' " 内的 ; && || 不作为分隔符
@@ -183,8 +208,10 @@ try {
 
 const command = input?.tool_input?.command ?? input?.command ?? '';
 const rawCmd = typeof command === 'string' ? command.trim() : '';
-// 对 PowerShell(& 'bash.exe' -c '...') 这类双层封装，提取内层真实命令再分析。
-const cmd = unwrapShell(rawCmd);
+// 预处理链：解封装 → 变量解析（$p=... 替换） → 剥离无害输出重定向（>/dev/null、Out-File 到 Temp）
+let cmd = unwrapShell(rawCmd);
+cmd = resolveVars(cmd);
+cmd = stripHarmlessRedir(cmd);
 
 // --rules 重放：直接用日志里的命中项构造用户层，完全不依赖 permission.json
 let userLayer;
@@ -305,17 +332,29 @@ if (userLayer.mode === 'no-ask' || (projLayer && projLayer.mode === 'no-ask')) {
   decision('allow', REASON.ALLOW_MODE_NOASK, '✅ mode=no-ask：未命中 deny 规则，放行');
   process.exit(0);
 }
-// 剥离无害的输出丢弃型重定向：2>&1 / >&2 / &>/dev/null / >/dev/null / 2>/dev/null。
-// 真正写文件的 > / >> 保留，仍会被下面的运算符检查拦下。
+// 剥离无害的输出丢弃型重定向：
+//   fd 复制 2>&1 / >&2；写到 /dev/null；Out-File 到临时目录（输出暂存再读回，无实际副作用）。
+// 真正写到其他文件的 > / >> / Out-File 保留，仍会被运算符检查拦下。
 function stripHarmlessRedir(s) {
-  return s
+  let r = s
     .replace(/[12]?>\s*&\s*[12]\b/g, '')
     .replace(/&>\s*\/dev\/null\b/g, '')
     .replace(/[12]?>\s*\/dev\/null\b/g, '');
+  // | Out-File -FilePath "<Temp路径>" [-Encoding utf8] → 整段剥离（Temp 目录视为输出暂存）
+  r = r.replace(/\|?\s*Out-File\s+-FilePath\s+['"]([^'"]*\b(?:Temp|TEMP|tmp)\b[^'"]*)['"](\s+-Encoding\s+\S+)?/gi, (_, p) => {
+    return isTempPath(p) ? '' : _; // 非 Temp 路径保留
+  });
+  return r;
+}
+
+// 路径是否位于临时目录（Out-File 无害判定）
+function isTempPath(p) {
+  return /[/\\](Temp|TEMP|tmp)[/\\]/i.test(p) || /^[/\\]tmp[/\\]/i.test(p);
 }
 
 // 1. 管道/重定向/反引号/命令替换/单 & 调用操作符 → ask（按运算符类型细分 reason）
-const normalizedForCheck = stripHarmlessRedir(cmd.split('&&').join(';').split('||').join(';'));
+// cmd 已在预处理链剥离无害重定向（2>&1、Out-File 到 Temp 等），这里检查剩余的真运算符。
+const normalizedForCheck = cmd.split('&&').join(';').split('||').join(';');
 const opMatch = normalizedForCheck.match(/[|&`><]|\$\(/);
 if (opMatch) {
   const op = opMatch[0];
