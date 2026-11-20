@@ -190,8 +190,10 @@ function stripQuoted(s) {
 }
 
 // 复杂结构：PowerShell 控制流关键词（引号外）、{} 脚本块、多行。
-// 注意：do 不列入——它是 herdr-app.exe 的子命令（do xxx），真正的 do-while 循环必带 {} 已被上面覆盖。
-const COMPLEX_RE = /\b(for|foreach|while|if|elseif|switch|function|filter|trap|try|catch|finally|param|begin|process|end)\b/i;
+// 注意：
+//   - do 不列入——它是 herdr-app.exe 的子命令（do xxx），真正的 do-while 必带 {} 已被覆盖。
+//   - if/elseif 要求后跟 '('（PowerShell 语法 if (...)），避免误判 dd 的 if= 参数。
+const COMPLEX_RE = /(\bfor\b|\bforeach\b|\bwhile\b|\bif\s*\(|\belseif\s*\(|\bswitch\b|\bfunction\b|\bfilter\b|\btrap\b|\btry\b|\bcatch\b|\bfinally\b|\bparam\b|\bbegin\b|\bprocess\b|\bend\b)/i;
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
@@ -362,14 +364,53 @@ function extractDeleteTarget(seg) {
   return null;
 }
 
-// 提取段中的复制命令目标路径：cp <src...> <dest>。dest 为最后一个参数（忽略 -r/-p 等选项）。
-function extractCopyTarget(seg) {
-  const m = seg.match(/^cp\s+(?:-[a-z]+\s+)*(.+)$/i);
+// 通用写命令目标提取：覆盖 shell 与 PowerShell 的写/复制/创建命令。
+// 返回 { target } 或 null。目标位置按命令语义分三类。
+function extractWriteCommandTarget(seg) {
+  const s = seg.trim();
+  // 命令 → 目标取法：'last'=最后非选项参数, 'first'=第一个非选项参数, 数字=第N个参数, 'of='=dd的of=
+  const CMD_TARGET = {
+    // shell: 复制/移动（目标=最后参数）
+    cp: 'last', install: 'last', rsync: 'last', mv: 'last', 'move': 'last', ln: 'last',
+    // shell: 创建/写（目标=第一个参数）
+    touch: 'first', mkdir: 'first', 'tee': 'first',
+    // PowerShell: 复制/移动（最后参数）
+    'copy-item': 'last', 'move-item': 'last',
+    // PowerShell: 创建/写（第一个参数）
+    'new-item': 'first', 'set-content': 'first', 'add-content': 'first', 'tee-object': 'first',
+  };
+  let m = s.match(/^([a-z][a-z0-9-]*)\s+(.+)$/i);
   if (!m) return null;
-  const args = m[1].trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
-  if (!args || args.length < 2) return null; // 至少需要 src + dest
-  const target = args[args.length - 1].replace(/^['"]|['"]$/g, '');
-  return { target };
+  const cmd = m[1].toLowerCase();
+
+  // dd：目标在 of=<path>
+  if (cmd === 'dd') {
+    const of = s.match(/\bof\s*=\s*['"]?([^'"\s]+)['"]?/i);
+    return of ? { target: of[1] } : null;
+  }
+  // tar：cf <archive>
+  if (cmd === 'tar') {
+    const cf = s.match(/\b[cz][xf]\s+['"]?([^'"\s]+)['"]?/i);
+    return cf ? { target: cf[1] } : null;
+  }
+  // Out-File -FilePath（已由 extractWriteTarget 处理重定向剥离，这里也支持独立命令形态）
+  if (cmd === 'out-file') {
+    const fp = s.match(/-FilePath\s+['"]?([^'"\s]+)['"]?/i);
+    return fp ? { target: fp[1] } : null;
+  }
+
+  const mode = CMD_TARGET[cmd];
+  if (!mode) return null;
+  const args = m[2].trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
+  if (!args) return null;
+  const clean = args.map(a => a.replace(/^['"]|['"]$/g, ''));
+  // 过滤纯选项参数（以 - 开头，但排除负数字）
+  const positional = clean.filter(a => !/^-[a-z]/i.test(a));
+  let target;
+  if (mode === 'last') target = positional[positional.length - 1];
+  else if (mode === 'first') target = positional[0];
+  else target = positional[mode - 1];
+  return target ? { target } : null;
 }
 
 // 剥离无害的输出重定向：
@@ -468,8 +509,8 @@ const results = segs.map((seg, i) => {
     const dm = firstMatch(projDelete, dt.target) || firstMatch(deleteRules, dt.target);
     if (dm) return { kind: 'safe', seg, i, dmRule: dm.rule };
   }
-  // 复制目标命中 write_allow（如 Temp）→ safe
-  const ct = extractCopyTarget(seg);
+  // 写命令目标命中 write_allow（如 Temp）→ safe（cp/mv/touch/mkdir/tee/Copy-Item/New-Item/Set-Content...）
+  const ct = extractWriteCommandTarget(seg);
   if (ct) {
     const cm = firstMatch(projWrite, ct.target) || firstMatch(writeRules, ct.target);
     if (cm) return { kind: 'safe', seg, i, wmRule: cm.rule };
