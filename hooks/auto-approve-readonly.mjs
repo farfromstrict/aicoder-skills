@@ -362,6 +362,16 @@ function extractDeleteTarget(seg) {
   return null;
 }
 
+// 提取段中的复制命令目标路径：cp <src...> <dest>。dest 为最后一个参数（忽略 -r/-p 等选项）。
+function extractCopyTarget(seg) {
+  const m = seg.match(/^cp\s+(?:-[a-z]+\s+)*(.+)$/i);
+  if (!m) return null;
+  const args = m[1].trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
+  if (!args || args.length < 2) return null; // 至少需要 src + dest
+  const target = args[args.length - 1].replace(/^['"]|['"]$/g, '');
+  return { target };
+}
+
 // 剥离无害的输出重定向：
 //   fd 复制 2>&1 />&2、写 /dev/null → 直接剥离；
 //   写目标命中 write_allow（如 Temp）→ 剥离该重定向，记入 hit_rules.write_allow。
@@ -458,6 +468,12 @@ const results = segs.map((seg, i) => {
     const dm = firstMatch(projDelete, dt.target) || firstMatch(deleteRules, dt.target);
     if (dm) return { kind: 'safe', seg, i, dmRule: dm.rule };
   }
+  // 复制目标命中 write_allow（如 Temp）→ safe
+  const ct = extractCopyTarget(seg);
+  if (ct) {
+    const cm = firstMatch(projWrite, ct.target) || firstMatch(writeRules, ct.target);
+    if (cm) return { kind: 'safe', seg, i, wmRule: cm.rule };
+  }
   const a = firstMatch(askRules, seg);
   if (a) return { kind: 'ask', seg, i, rule: a.rule };
   const w = firstMatch(allowRules, seg);
@@ -470,6 +486,7 @@ const results = segs.map((seg, i) => {
 for (const r of results) {
   if (r.rule) trackHit(r.kind === 'allow' ? 'allow' : r.kind, r.rule);
   if (r.dmRule) trackHit('delete_allow', r.dmRule);
+  if (r.wmRule) trackHit('write_allow', r.wmRule);
 }
 
 // 4. 任一段命中 deny → 拦截并指出所在段
