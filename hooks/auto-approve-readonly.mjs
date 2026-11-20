@@ -456,8 +456,12 @@ function stripParens(s) {
 
 function isSegSafe(s) {
   // PowerShell 子表达式包装如 (Get-Content ... | ConvertFrom-Json).overlays —— 去掉首尾括号再判定
-  const t = stripParens(s);
+  let t = stripParens(s);
+  // 剥调用操作符 &（管道后段首可能为 & node ...）
+  t = t.replace(/^&\s+/, '').trim();
   if (firstMatch(projDeny, t) || firstMatch(denyRules, t)) return false;
+  // 纯引号字符串字面量（管道喂给脚本的 stdin 数据）无副作用
+  if (/^(['"]).*\1$/.test(t)) return true;
   if (isSafeSegment(t)) return true;
   if (firstMatch(projAllow, t) || firstMatch(allowRules, t)) return true;
   return false;
@@ -484,7 +488,10 @@ function splitPipes(cmd) {
 function normalizeSafePipes(s) {
   if (!s.includes('|') || s.includes('||')) return s;
   const parts = splitPipes(s).flatMap(p => splitSegments(p)).filter(Boolean);
-  if (parts.length && parts.every(isSegSafe)) return parts.join('; ');
+  if (parts.length && parts.every(isSegSafe)) {
+    // 归一化后剥掉段首调用操作符 &，避免残留 & 触发 EXTERNAL_CALL 检查
+    return parts.map(p => p.replace(/^&\s+/, '').trim()).join('; ');
+  }
   return s;
 }
 
@@ -504,7 +511,9 @@ if (opMatch) {
 }
 
 // 2. 复杂结构 → ask（诚实告知无法分析）
-if (/[\r\n]/.test(cmd) || /[{}]/.test(cmd) || COMPLEX_RE.test(stripQuoted(cmd))) {
+// 用 stripQuoted 去掉引号内内容，避免把管道传入的 JSON 字符串（含 {}）误判为脚本块。
+const cmdNoQuoted = stripQuoted(cmd);
+if (/[\r\n]/.test(cmd) || /[{}]/.test(cmdNoQuoted) || COMPLEX_RE.test(cmdNoQuoted)) {
   decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含循环/脚本块等复杂结构，无法自动分析，请人工审查');
   process.exit(0);
 }
@@ -525,6 +534,8 @@ const results = segs.map((seg, i) => {
   }
   const d = firstMatch(denyRules, segT);
   if (d) return { kind: 'deny', seg, i, rule: d.rule };
+  // 纯引号字符串字面量（管道喂给脚本的 stdin 数据）无副作用
+  if (/^(['"]).*\1$/.test(segT)) return { kind: 'safe', seg, i };
   if (isSafeSegment(segT)) return { kind: 'safe', seg, i };
   // 删除目标命中 delete_allow（如 Temp）→ safe（多文件时全部命中才放行）
   const dt = extractDeleteTarget(segT);
