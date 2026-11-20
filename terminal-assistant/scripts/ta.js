@@ -8,11 +8,6 @@
  *   send   <pane> <text>     注入文本+回车（--force/--if；--wait 已废弃）
  *   wait   <pane> --match X  标记轮询：反复读屏幕直到出现 X（不依赖 hc turn/status）
  *
- * 同步执行 shell 命令：send 注入命令末尾拼 echo __TA_<标签>_${RANDOM}${RANDOM}__ →
- *   wait --regex '__TA_<标签>_[0-9]+__'。标记值动态生成，回显里的 ${RANDOM} 字面量不匹配，
- *   只有命令真正输出的标记才命中，避免回显误判完成。
- * 不用 hc 的 send --wait / turn 状态：裸 shell 不上报 turn，会挂到超时。
- *
  * probe 只读无副作用。read 只读。send/wait 会写/监听窗格 ——
  * 安全由外部 guard hook 负责（本脚本不内置拦截）。
  *
@@ -177,7 +172,15 @@ function collectHc(self) {
   try { terms = JSON.parse(lsRaw).terminals || []; } catch (_) {}
   const selfTerm = terms.find(t => t.address === self);
   const where = selfTerm ? selfTerm.where : '';
-  const screen = terms.filter(t => t.where === where);
+  const selfInfo = hcGetInfo(self);
+  // 本屏幕 = 与 self 同 space+tab 的窗格。where 只是显示名，不同 space 可重名
+  // （如本机与 WSL 都叫 aitalk / 1），不能用它判定，否则会跨 space 误收窗格。
+  const screen = selfInfo.space && selfInfo.tab
+    ? terms.filter(t => {
+        const info = hcGetInfo(t.address);
+        return info.space === selfInfo.space && info.tab === selfInfo.tab;
+      })
+    : terms.filter(t => t.where === where); // labels 缺失时回退旧逻辑
 
   // 布局树：从 docs.json 找 self 所在 tab 的 root，按递归方向给 terminal 标 role
   // 路径因平台而异：
@@ -216,9 +219,13 @@ function collectHc(self) {
     }
   } catch (_) {}
 
-  const panes = screen.map(t => ({
-    id: t.address, cwd: t.cwd || '', title: t.where || '', self: t.address === self,
-  }));
+  const panes = screen.map(t => {
+    const info = hcGetInfo(t.address);
+    return {
+      id: t.address, cwd: info.cwd || t.cwd || '', title: t.where || '', self: t.address === self,
+      isAgent: info.isAgent,
+    };
+  });
   // hc 的 docs.json 没有几何坐标，用布局树角色覆盖
   let roles = assignRoles(panes);
   let hasLayoutRole = false;
@@ -306,6 +313,7 @@ function render(id, info) {
       screen: info ? info.screen : '', source: info ? info.source : '',
       panes: (info ? info.panes : []).map(p => ({
         role: (info.roles[p.id] || '?'), id: p.id, self: p.self, cwd: p.cwd, title: p.title,
+        isAgent: !!p.isAgent,
       })),
     }, null, 2));
     return;
@@ -330,8 +338,7 @@ function render(id, info) {
   out(`  ${C.d}screen${C.r}  : ${info.screen || '(n/a)'}`);
   out(`  ${C.d}source${C.r}  : ${info.source}`);
   out('');
-  const pad = (s, n) => String(s).padEnd(n).slice(0, n);
-  out(`  ${pad('ROLE', 8)}${pad('ID', 10)}${pad('SELF', 6)}${pad('CWD', 34)}TITLE`);
+  // 受众是加载 SKILL 的 LLM：一行一窗格、key=value、无截断，避免残缺信息误导。
   const order = { az: 0, ez1: 1, wz1: 2 };
   const sorted = [...info.panes].sort((a, b) => {
     const ra = info.roles[a.id] || 'zz', rb = info.roles[b.id] || 'zz';
@@ -340,7 +347,7 @@ function render(id, info) {
   for (const p of sorted) {
     const role = info.roles[p.id] || '?';
     const rc = role === 'az' ? C.y : C.g;
-    out(`  ${rc}${pad(role, 8)}${C.r}${pad(p.id, 10)}${p.self ? 'YES' : '   '}   ${pad(p.cwd, 34)}${p.title}`);
+    out(`  ${rc}${role}${C.r}  id=${p.id}  self=${p.self ? 'YES' : 'no'}  agent=${p.isAgent ? 'agent' : 'shell'}  cwd=${p.cwd}  title=${p.title}`);
   }
   out(`\n  ${C.d}注${C.r}：无 ta-ezN/ta-wzN 标记时为几何/顺序临时编号；写只在本屏幕，跨屏只读。`);
   hline();
@@ -392,12 +399,36 @@ function runLive(cmd, argv) {
   }
 }
 
+// 一次 hc get 拿全一个 pane 的元信息：是否 agent、实时 cwd、space/tab ID。
+// - isAgent：agent 有 status 对象或 turn>0，裸 shell 为 null/0。不用 agent 字段
+//   判断——它是启动程序名，裸 shell 也显示 bash.exe。
+// - cwd：foreground.cwd 是实时工作目录；顶层 cwd 是启动快照（会滞后于 cd）。
+// - space/tab：来自 labels，是判定"本屏幕"的唯一可靠依据（where 显示名会重名）。
+function hcGetInfo(pane) {
+  let j = null;
+  try {
+    j = JSON.parse(runLive('hc', ['get', '--json', pane]));
+  } catch (_) {}
+  const labels = (j && j.labels) || {};
+  return {
+    isAgent: !!(j && (j.status != null || (j.turn || 0) > 0)),
+    cwd: (j && j.foreground && j.foreground.cwd) || (j && j.cwd) || '',
+    space: labels['herdr.space'] || '',
+    tab: labels['herdr.tab'] || '',
+  };
+}
+
+function hcIsAgent(pane) {
+  return hcGetInfo(pane).isAgent; // 查不到 → isAgent=false，按裸 shell 处理（用 raw 最安全）
+}
+
 function parseOpts(rest) {
   const o = {};
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--force') o.force = true;
     else if (a === '--wait') o.wait = true;
+    else if (a === '--raw') o.raw = true;
     else if (a === '--if') o.ifStatus = rest[++i];
     else if (a === '--match') o.match = rest[++i];
     else if (a === '--regex') o.regex = rest[++i];
@@ -407,7 +438,7 @@ function parseOpts(rest) {
 }
 
 // ---------------------------------------------------------------- main（子命令分发）
-(function main() {
+function main() {
   const argv = args.filter(a => a !== '--json' && a !== '--no-color');
   const sub = argv[0] || 'probe';
   const rest = argv.slice(1);
@@ -443,11 +474,22 @@ function parseOpts(rest) {
 
   if (sub === 'send') {
     const pane = rest[0], text = rest[1];
-    if (!pane || text == null) { out('用法: ta.js send <pane> <text> [--force] [--if idle|working]'); process.exit(2); }
+    if (!pane || text == null) { out('用法: ta.js send <pane> <text> [--raw] [--force] [--if idle|working]'); process.exit(2); }
     const opts = parseOpts(rest.slice(2));
     if (opts.wait) process.stderr.write('提示: --wait 已废弃（hc 的 turn 状态对裸 shell 不可靠）；同步等待请用 wait --match <唯一标记>\n');
+    // 裸 shell 不认识 <hc> 包装（< 被当重定向符），自动去包装；agent 保留包装。
+    // --raw 可强制去包装。
+    const wantRaw = !!opts.raw || (id.backend === 'hc' && !hcIsAgent(pane));
+    if (wantRaw) delete process.env.HC_TERMINAL_ID;
     const [cmd, a] = cmdSend(id, pane, text, opts);
-    process.stdout.write(runLive(cmd, a));
+    const raw = runLive(cmd, a);
+    // hc send 原样返回 {"started":..,"status":..,"turn":..}：对裸 shell 恒为
+    // false/null/0，容易被误读成"没发出去"。成功判据是随后 read 回读，故精简为
+    // 一句确认；非 JSON（错误文本）则原样透传，不丢诊断信息。
+    let sent = false;
+    try { JSON.parse(raw); sent = true; } catch (_) {}
+    if (sent) out(`sent → ${pane}`);
+    else process.stdout.write(raw);
     return;
   }
 
@@ -477,4 +519,9 @@ function parseOpts(rest) {
 
   out('未知子命令: ' + sub + '（可用: probe/read/send/wait）');
   process.exit(2);
-})();
+}
+
+// 被 require 时不执行 main，便于测试导出函数；作为 CLI 直接运行时行为不变。
+if (require.main === module) main();
+
+module.exports = { render, assignRoles, collectHcRoles, normalizeRole, hcGetInfo };
