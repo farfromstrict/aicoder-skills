@@ -495,7 +495,16 @@ function normalizeSafePipes(s) {
   return s;
 }
 
-// 1. 管道/重定向/反引号/命令替换/单 & 调用操作符 → ask（按运算符类型细分 reason）
+// 1. 复杂结构优先判定 → ask。带 {} 脚本块/控制流的命令，本质是"无法可靠分析"，
+// 比管道/重定向等运算符更根本，故优先于下面的运算符检查（给出更准的 reason）。
+// 用 stripQuoted 去掉引号内内容，避免把管道传入的 JSON 字符串（含 {}）误判为脚本块。
+const cmdNoQuoted = stripQuoted(cmd);
+if (/[\r\n]/.test(cmd) || /[{}]/.test(cmdNoQuoted) || COMPLEX_RE.test(cmdNoQuoted)) {
+  decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含循环/脚本块等复杂结构，无法自动分析，请人工审查');
+  process.exit(0);
+}
+
+// 2. 管道/重定向/反引号/命令替换/单 & 调用操作符 → ask（按运算符类型细分 reason）
 // cmd 已在预处理链剥离无害重定向（2>&1、Out-File 到 Temp）并归一化安全管道，这里检查剩余的真运算符。
 // 用 stripQuoted 去掉引号内内容，避免把 -Pattern "a|b" 这类引号内的 | <> 误判为运算符。
 const normalizedForCheck = stripQuoted(cmd.split('&&').join(';').split('||').join(';'));
@@ -507,14 +516,6 @@ if (opMatch) {
     : op === '&' ? REASON.ASK_EXTERNAL_CALL
     : REASON.ASK_OPERATOR_SUBST; // ` 或 $(
   decision('ask', opReason, '⚠️ 包含管道/重定向等运算符，无法自动分析');
-  process.exit(0);
-}
-
-// 2. 复杂结构 → ask（诚实告知无法分析）
-// 用 stripQuoted 去掉引号内内容，避免把管道传入的 JSON 字符串（含 {}）误判为脚本块。
-const cmdNoQuoted = stripQuoted(cmd);
-if (/[\r\n]/.test(cmd) || /[{}]/.test(cmdNoQuoted) || COMPLEX_RE.test(cmdNoQuoted)) {
-  decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含循环/脚本块等复杂结构，无法自动分析，请人工审查');
   process.exit(0);
 }
 
