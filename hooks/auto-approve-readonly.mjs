@@ -434,10 +434,17 @@ function stripHarmlessRedir(s) {
 }
 
 // 单段是否安全（供安全管道判定用）：命中 deny→false；safe/allow→true；其余 false。
+// 去掉 PowerShell 子表达式包装的首尾括号：(Get-Content ...).overlays → Get-Content ...
+function stripParens(s) {
+  return s.trim().replace(/^\(+/, '').replace(/\)+(?:\.\w+)?$/, '').trim();
+}
+
 function isSegSafe(s) {
-  if (firstMatch(projDeny, s) || firstMatch(denyRules, s)) return false;
-  if (isSafeSegment(s)) return true;
-  if (firstMatch(projAllow, s) || firstMatch(allowRules, s)) return true;
+  // PowerShell 子表达式包装如 (Get-Content ... | ConvertFrom-Json).overlays —— 去掉首尾括号再判定
+  const t = stripParens(s);
+  if (firstMatch(projDeny, t) || firstMatch(denyRules, t)) return false;
+  if (isSafeSegment(t)) return true;
+  if (firstMatch(projAllow, t) || firstMatch(allowRules, t)) return true;
   return false;
 }
 
@@ -490,34 +497,35 @@ if (/[\r\n]/.test(cmd) || /[{}]/.test(cmd) || COMPLEX_RE.test(stripQuoted(cmd)))
 // 3. 拆段并逐段分类：deny > safe > ask > allow > unknown
 const segs = splitSegments(cmd);
 const results = segs.map((seg, i) => {
+  const segT = stripParens(seg); // 判定用去括号版本，日志仍保留原文 seg
   if (projLayer) {
     if (projLayer.mode === 'allow-all') return { kind: 'allow', seg, i, layer: '[项目级]', note: 'mode=allow-all' };
-    const pd = firstMatch(projDeny, seg);
+    const pd = firstMatch(projDeny, segT);
     if (pd) return { kind: 'deny', seg, i, layer: '[项目级]', rule: pd.rule };
-    const pa = firstMatch(projAsk, seg);
+    const pa = firstMatch(projAsk, segT);
     if (pa) return { kind: 'ask', seg, i, layer: '[项目级]', rule: pa.rule };
-    const pw = firstMatch(projAllow, seg);
+    const pw = firstMatch(projAllow, segT);
     if (pw) return { kind: 'allow', seg, i, layer: '[项目级]', rule: pw.rule };
     if (projLayer.mode === 'no-ask') return { kind: 'allow', seg, i, layer: '[项目级]', note: 'mode=no-ask' };
   }
-  const d = firstMatch(denyRules, seg);
+  const d = firstMatch(denyRules, segT);
   if (d) return { kind: 'deny', seg, i, rule: d.rule };
-  if (isSafeSegment(seg)) return { kind: 'safe', seg, i };
+  if (isSafeSegment(segT)) return { kind: 'safe', seg, i };
   // 删除目标命中 delete_allow（如 Temp）→ safe
-  const dt = extractDeleteTarget(seg);
+  const dt = extractDeleteTarget(segT);
   if (dt) {
     const dm = firstMatch(projDelete, dt.target) || firstMatch(deleteRules, dt.target);
     if (dm) return { kind: 'safe', seg, i, dmRule: dm.rule };
   }
   // 写命令目标命中 write_allow（如 Temp）→ safe（cp/mv/touch/mkdir/tee/Copy-Item/New-Item/Set-Content...）
-  const ct = extractWriteCommandTarget(seg);
+  const ct = extractWriteCommandTarget(segT);
   if (ct) {
     const cm = firstMatch(projWrite, ct.target) || firstMatch(writeRules, ct.target);
     if (cm) return { kind: 'safe', seg, i, wmRule: cm.rule };
   }
-  const a = firstMatch(askRules, seg);
+  const a = firstMatch(askRules, segT);
   if (a) return { kind: 'ask', seg, i, rule: a.rule };
-  const w = firstMatch(allowRules, seg);
+  const w = firstMatch(allowRules, segT);
   if (w) return { kind: 'allow', seg, i, rule: w.rule };
   if (userLayer.mode === 'no-ask') return { kind: 'allow', seg, i, layer: '[用户级]', note: 'mode=no-ask' };
   if (userLayer.mode === 'allow-all') return { kind: 'allow', seg, i, layer: '[用户级]', note: 'mode=allow-all' };
