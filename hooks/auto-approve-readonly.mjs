@@ -355,12 +355,27 @@ function extractWriteTarget(seg) {
   return null;
 }
 
-// 提取段中的删除目标路径：rm [-f...] / Remove-Item。返回 { target, re } 或 null。
+// 提取段中的删除目标路径：rm [-f...] / Remove-Item。支持逗号分隔的多文件。
+// 返回 { targets: [...] } 或 null。
+function parseQuotedList(s) {
+  // 匹配引号包裹或裸 token，支持逗号分隔（带或不带空格）
+  const tokens = s.match(/(['"])(.*?)\1|([^\s,]+)/g);
+  if (!tokens) return [];
+  return tokens.map(t => t.replace(/^['"]|['"]$/g, '').trim()).filter(Boolean);
+}
 function extractDeleteTarget(seg) {
-  let m = seg.match(/^rm\s+(?:-[a-z]+(?::\S+)?\s+)*['"]?([^'">|;]+?)['"]?(?:\s+-[a-z]+(?::\S+)?)?\s*$/i);
-  if (m) return { target: m[1].trim(), re: /^rm\s+.*$/i };
-  m = seg.match(/^Remove-Item\s+(?:-[a-z]+(?::\S+)?\s+)*['"]?([^'">|;]+?)['"]?(?:\s+-[a-z]+(?::\S+)?)?\s*$/i);
-  if (m) return { target: m[1].trim(), re: /^Remove-Item\s+.*$/i };
+  let m = seg.match(/^rm\s+([\s\S]+)$/i);
+  if (m) {
+    const params = m[1].replace(/\s+-[a-z]+(?::\S+)?\s*$/i, '').trim(); // 去尾部选项
+    const targets = parseQuotedList(params).filter(t => !/^-[a-z]/i.test(t));
+    return targets.length ? { targets } : null;
+  }
+  m = seg.match(/^Remove-Item\s+([\s\S]+)$/i);
+  if (m) {
+    const params = m[1].replace(/\s+-[a-z]+(?::\S+)?\s*$/i, '').trim();
+    const targets = parseQuotedList(params).filter(t => !/^-[a-z]/i.test(t));
+    return targets.length ? { targets } : null;
+  }
   return null;
 }
 
@@ -511,11 +526,17 @@ const results = segs.map((seg, i) => {
   const d = firstMatch(denyRules, segT);
   if (d) return { kind: 'deny', seg, i, rule: d.rule };
   if (isSafeSegment(segT)) return { kind: 'safe', seg, i };
-  // 删除目标命中 delete_allow（如 Temp）→ safe
+  // 删除目标命中 delete_allow（如 Temp）→ safe（多文件时全部命中才放行）
   const dt = extractDeleteTarget(segT);
   if (dt) {
-    const dm = firstMatch(projDelete, dt.target) || firstMatch(deleteRules, dt.target);
-    if (dm) return { kind: 'safe', seg, i, dmRule: dm.rule };
+    const allAllowed = dt.targets.every(t => firstMatch(projDelete, t) || firstMatch(deleteRules, t));
+    if (allAllowed) {
+      for (const t of dt.targets) {
+        const dm = firstMatch(projDelete, t) || firstMatch(deleteRules, t);
+        if (dm) trackHit('delete_allow', dm.rule);
+      }
+      return { kind: 'safe', seg, i };
+    }
   }
   // 写命令目标命中 write_allow（如 Temp）→ safe（cp/mv/touch/mkdir/tee/Copy-Item/New-Item/Set-Content...）
   const ct = extractWriteCommandTarget(segT);
