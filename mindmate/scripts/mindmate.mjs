@@ -38,6 +38,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -2149,6 +2150,274 @@ function cmdShelf(values) {
   return 0;
 }
 
+// ---------------------------------------------------------------- timing (telemetry)
+// Append-only, best-effort wall-clock events used to analyse capture stage costs.
+// Lives in the global home telemetry dir: never inside a knowledge root, never
+// globbed or read by normal commands. Any failure is swallowed so telemetry can
+// never break a real command.
+
+const TIMING_DIR = path.join(HOME, '.mindmate', 'telemetry');
+const TIMING_FILE = path.join(TIMING_DIR, 'timing.jsonl');
+const TIMING_META_KEYS = new Set(['space', 'run']);
+
+function emitTiming(event, meta) {
+  try {
+    const rec = { ts: Date.now(), event };
+    if (meta && Object.keys(meta).length) rec.meta = meta;
+    fs.mkdirSync(TIMING_DIR, { recursive: true });
+    fs.appendFileSync(TIMING_FILE, JSON.stringify(rec) + '\n', 'utf8');
+  } catch (_) { /* telemetry is best-effort */ }
+}
+
+function cmdTiming(values) {
+  const event = values.event;
+  if (!event || !/^[a-z][a-z0-9:_-]*$/.test(event)) {
+    console.error('usage: timing --event <name> [--meta \'{"run":"..."}\']');
+    console.error('  event: lowercase slug, e.g. contract:loaded, confirm:shown, roots:end');
+    return 1;
+  }
+  let meta;
+  if (values.meta) {
+    let parsed;
+    try { parsed = JSON.parse(values.meta); }
+    catch (_) { console.error('timing: --meta must be valid JSON'); return 1; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      console.error('timing: --meta must be a JSON object');
+      return 1;
+    }
+    meta = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (!TIMING_META_KEYS.has(k)) { console.error(`timing: meta key '${k}' not allowed (use space|run)`); return 1; }
+      if (typeof v !== 'string' || !/^[A-Za-z0-9_-]+$/.test(v)) {
+        console.error(`timing: meta value for '${k}' must be a simple slug`);
+        return 1;
+      }
+      meta[k] = v;
+    }
+  }
+  emitTiming(event, meta);
+  return 0;
+}
+
+// Wrap a deterministic command so it emits <name>:begin / <name>:end (with ms).
+function timed(name, fn) {
+  emitTiming(`${name}:begin`);
+  const t0 = Date.now();
+  try {
+    return fn();
+  } finally {
+    emitTiming(`${name}:end`, { ms: Date.now() - t0 });
+  }
+}
+
+// ---------------------------------------------------------------- stage-commit
+// Write a batch of pre-authored files verbatim from a manifest, then rebuild
+// index.md and append log.md entries. The manifest carries the exact content
+// already shown/approved in capture's confirm step, so the LLM never regenerates
+// it. Dry-run by default; --apply commits. Idempotent via a per-run receipt.
+
+const STAGING_DIR = path.join(DEFAULT_CONTROL, '.staging');
+
+function stagingPath(name) { return path.join(STAGING_DIR, name); }
+
+function readManifest(file) {
+  let text;
+  try { text = fs.readFileSync(path.resolve(expandHome(file)), 'utf8'); }
+  catch (e) { throw new Error(`读取 manifest 失败: ${e.message}`); }
+  let m;
+  try { m = JSON.parse(text); } catch (e) { throw new Error(`manifest 非法 JSON: ${e.message}`); }
+  const fail = (msg) => { throw new Error(`manifest 校验失败: ${msg}`); };
+  if (!m || typeof m !== 'object' || Array.isArray(m)) fail('顶层必须是对象');
+  if (typeof m.run !== 'string' || !/^[a-z0-9][a-z0-9_-]*$/i.test(m.run)) fail('run 必须是 slug');
+  if (typeof m.root !== 'string' || !m.root) fail('root 必填');
+  if (!Array.isArray(m.files) || !m.files.length) fail('files 必须是非空数组');
+  for (const [i, f] of m.files.entries()) {
+    if (!f || typeof f.path !== 'string' || typeof f.content !== 'string') fail(`files[${i}] 需要 path 与 content 字符串`);
+    if (path.isAbsolute(f.path) || f.path.split('/').includes('..')) fail(`files[${i}].path 必须为根内相对路径且不含 ..`);
+    if (RESERVED.has(path.basename(f.path))) fail(`files[${i}].path 不得写保留名 index.md/log.md`);
+    if (!/^(create|update)$/.test(f.action || 'create')) fail(`files[${i}].action 只能 create|update`);
+  }
+  if (m.indexSpaces != null && (!Array.isArray(m.indexSpaces) || m.indexSpaces.some((s) => typeof s !== 'string'))) fail('indexSpaces 必须是字符串数组');
+  if (m.log != null) {
+    if (typeof m.log.space !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(m.log.date || '')) fail('log.space 必填且 log.date 需 YYYY-MM-DD');
+    if (!Array.isArray(m.log.entries)) fail('log.entries 必须是数组');
+  }
+  return m;
+}
+
+// Append entries under a `## YYYY-MM-DD` group, newest group at top.
+function appendLogGroup(logPath, date, entries) {
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  let text = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '# Directory Update Log\n';
+  const lines = text.split('\n');
+  const heading = `## ${date}`;
+  const hIdx = lines.findIndex((l) => l.trim() === heading);
+  if (hIdx >= 0) {
+    let end = hIdx + 1;
+    while (end < lines.length && !/^##\s/.test(lines[end])) end++;
+    while (end > hIdx + 1 && lines[end - 1].trim() === '') end--;
+    lines.splice(end, 0, ...entries);
+  } else {
+    let at = 0;
+    if (lines[0]?.startsWith('# ')) at = 1;
+    while (at < lines.length && lines[at].trim() === '') at++;
+    lines.splice(at, 0, heading, ...entries, '');
+  }
+  writeText(logPath, lines.join('\n').replace(/\n+$/, '') + '\n');
+}
+
+function cmdStageCommit(values) {
+  if (!values.manifest) { console.error('usage: stage-commit --manifest <path> [--apply] [--root <dir>]'); return 1; }
+  let m;
+  try { m = readManifest(values.manifest); } catch (e) { console.error(`ERROR: ${e.message}`); return 1; }
+
+  const root = controlRoot(); // --root / MMATE_ROOT / default, via ROOT_OVERRIDE already set in main
+  const manifestRoot = path.resolve(expandHome(m.root));
+  if (manifestRoot !== path.resolve(root)) {
+    console.error(`ERROR: manifest.root=${manifestRoot} 与当前 write_root=${path.resolve(root)} 不一致；请用 --root 指定同一根，防止误写其它根`);
+    return 1;
+  }
+  const apply = !!values.apply;
+  const run = m.run;
+  const receiptFile = stagingPath(`${run}.receipt.json`);
+  const hash = crypto.createHash('sha256').update(JSON.stringify(m)).digest('hex');
+
+  // Idempotency first: same run + same content => no-op; changed content => refuse.
+  if (fs.existsSync(receiptFile)) {
+    let prev;
+    try { prev = JSON.parse(fs.readFileSync(receiptFile, 'utf8')); } catch (_) { prev = {}; }
+    if (prev.hash === hash) { console.log(`  已提交过且内容一致，no-op (run=${run})`); return 0; }
+    console.error(`ERROR: run=${run} 已提交过但内容变化（防漂移）；请换 run 或手工清理 ${stagingPath(`${run}.receipt.json`)}`);
+    return 1;
+  }
+
+  // Validate targets before any write.
+  for (const [i, f] of m.files.entries()) {
+    const abs = path.join(root, f.path);
+    const exists = fs.existsSync(abs);
+    if (f.action === 'update' && !exists) { console.error(`ERROR: files[${i}] action=update 但目标不存在: ${f.path}`); return 1; }
+    if (f.action === 'create' && exists && fs.readFileSync(abs, 'utf8').trim()) {
+      console.error(`ERROR: files[${i}] action=create 但目标已非空（拒绝覆盖）: ${f.path}`); return 1;
+    }
+    if (/^secret:\s*\S+/m.test(f.content) && !f.content.includes('secret: <')) {
+      console.error(`ERROR: files[${i}] content 含疑似明文 secret 字段，拒绝落盘`); return 1;
+    }
+  }
+
+  const spaces = m.indexSpaces || [];
+  const logSpace = m.log?.space || null;
+  console.log(`stage-commit ${apply ? '--apply' : '(dry-run)'} | run=${run} | root=${path.resolve(root)}`);
+  for (const f of m.files) console.log(`  [${f.action}] ${f.path} (${Buffer.byteLength(f.content)} bytes)`);
+  for (const s of spaces) console.log(`  [index] space=${s}`);
+  if (m.log) console.log(`  [log] spaces/${logSpace}/log.md <- ## ${m.log.date} (${m.log.entries.length} 条)`);
+  if (!apply) { console.log('  (dry-run 未写入；加 --apply 提交)'); return 0; }
+
+  // Commit files.
+  emitTiming('write:begin');
+  for (const f of m.files) writeText(path.join(root, f.path), f.content);
+  emitTiming('write:end');
+  // Rebuild indexes (bundle roots included via runIndex) + append log.
+  emitTiming('index:begin');
+  const spacesRoot = resolveSpaces(values.spaces);
+  const rulesRoot = resolveRules(values.rulesRoot);
+  const rolesRoot = resolveRoles(values.rolesRoot);
+  const shelfRoot = resolveShelf(values.shelfRoot);
+  for (const s of spaces) {
+    if (!runIndex(spacesRoot, rulesRoot, rolesRoot, s, shelfRoot)) { console.error(`ERROR: 重建 index 失败 space=${s}`); return 1; }
+  }
+  if (m.log) appendLogGroup(path.join(spacesRoot, logSpace, 'log.md'), m.log.date, m.log.entries);
+  emitTiming('index:end');
+
+  fs.mkdirSync(STAGING_DIR, { recursive: true });
+  writeText(receiptFile, JSON.stringify({ run, hash, at: new Date().toISOString(), files: m.files.map((f) => f.path) }, null, 2));
+  emitTiming('stage-commit:applied', { run });
+  console.log(`  已提交 ${m.files.length} 个文件，重建 ${spaces.length} 个 index，log ${m.log ? m.log.entries.length : 0} 条；receipt=${path.basename(receiptFile)}`);
+  return 0;
+}
+
+// ---------------------------------------------------------------- quick
+// One-shot speed note: take --content + --slug, build a Source + Idea pair,
+// stage it, and commit via stage-commit. No LLM reasoning in this command.
+// The LLM's only job (outside this script) is intent judgement + slug naming.
+
+function sanitizeSlug(raw) {
+  let s = String(raw || '');
+  try { s = s.normalize('NFKD'); } catch (_) { /* keep original on error */ }
+  s = s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48).replace(/-+$/g, '');
+  return s || 'note';
+}
+
+function cmdQuick(values) {
+  if (!values.content || !String(values.content).trim()) {
+    console.error('usage: quick --content "<内容>" --slug "<slug>" [--root <dir>]');
+    return 1;
+  }
+  const root = controlRoot();
+  const spacesRoot = resolveSpaces(values.spaces);
+  // Naked bootstrap check (quick skips probe): if the knowledge root is not
+  // initialised there is nowhere to write; refuse early with a clear hint.
+  if (!fs.existsSync(spacesRoot)) {
+    console.error('ERROR: 知识库未初始化（spaces/ 不存在）；请先 bootstrap / init --apply，再 quick。');
+    return 1;
+  }
+
+  const content = String(values.content);
+  const slug = sanitizeSlug(values.slug || values.content);
+  const now = new Date();
+  const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+  const iso = `${date}T${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+  // local offset
+  const off = -now.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const offStr = `${sign}${String(Math.floor(Math.abs(off) / 60)).padStart(2, '0')}:${String(Math.abs(off) % 60).padStart(2, '0')}`;
+
+  // Collision: add -2, -3, ... to the whole pair so Source/Idea stay matched.
+  const srcRel = (s) => `shelf/sources/${date}-${s}.md`;
+  const ideaRel = (s) => `spaces/inbox/concepts/${s}.md`;
+  let finalSlug = slug, n = 2;
+  while (fs.existsSync(path.join(root, ideaRel(finalSlug))) || fs.existsSync(path.join(root, srcRel(finalSlug)))) {
+    finalSlug = `${slug}-${n++}`;
+  }
+  const run = `${stamp}-${finalSlug}`;
+
+  const sourceContent = `---\ntype: Source\ntitle: 原始输入：${content.split('\n')[0].slice(0, 60)}\ndescription: 用户速记的原样输入\ngenerated: { by: human:user, at: ${iso}${offStr} }\n---\n\n${content}\n`;
+  const ideaTitle = content.split('\n')[0].slice(0, 60);
+  const ideaContent = `---\ntype: Idea\ntitle: ${ideaTitle}\ndescription: ${date} 速记的原样要点，未展开、无结论\nstatus: draft\ntags: [quick]\nsources:\n  - id: s1\n    resource: /shelf/sources/${date}-${finalSlug}.md\n---\n\n用户于 ${date} 速记以下要点，未展开、尚无结论；原文原样列于「待确认」，不做提炼。\n\n事实：原始输入包含以下 1 条要点。\n推断：无。\n\n## 待确认\n- ${content}\n\n## 出处\n[^s1]\n\n[^s1]: 原始输入见 shelf/sources/${date}-${finalSlug}.md。\n\n## 关联\n同主题文档暂无其它，待后续摄入补充。\n`;
+
+  const manifest = {
+    run,
+    root,
+    files: [
+      { path: srcRel(finalSlug), content: sourceContent, action: 'create' },
+      { path: ideaRel(finalSlug), content: ideaContent, action: 'create' },
+    ],
+    indexSpaces: ['inbox'],
+    log: {
+      space: 'inbox',
+      date,
+      entries: [
+        `- **Creation** 摄入 Source \`${srcRel(finalSlug)}\`（用户速记原样输入；写入全局根 \`~/.mindmate\`）`,
+        `- **Creation** 新建 Idea \`concepts/${finalSlug}.md\`（\`type: Idea\`、\`status: draft\`，\`## 待确认\` 原样列要点、尚无结论；出处 \`s1\` 指向上述同一 Source；quick 速记）`,
+      ],
+    },
+  };
+
+  emitTiming('capture:start');
+  const mf = stagingPath(`${run}.json`);
+  try { writeText(mf, JSON.stringify(manifest, null, 2)); }
+  catch (e) { console.error(`ERROR: 写 manifest 失败: ${e.message}`); return 1; }
+
+  // Delegate all deterministic writes to stage-commit.
+  const rc = cmdStageCommit({ manifest: mf, apply: true, root });
+  if (rc !== 0) return rc;
+  emitTiming('capture:end');
+
+  // Fixed short report — LLM #2 turns this into one sentence.
+  console.log(`OK run=${run} files=2 space=inbox lint=pending paths=${srcRel(finalSlug)},${ideaRel(finalSlug)}`);
+  return 0;
+}
+
 // ---------------------------------------------------------------- cli
 
 function main() {
@@ -2179,6 +2448,11 @@ function main() {
       where: { type: 'string', multiple: true },
       sort: { type: 'string' },
       limit: { type: 'string', default: '8' },
+      event: { type: 'string' },
+      meta: { type: 'string' },
+      manifest: { type: 'string' },
+      content: { type: 'string' },
+      slug: { type: 'string' },
     },
     allowPositionals: true,
     strict: true,
@@ -2191,17 +2465,20 @@ function main() {
     case 'init-project': return cmdInitProject(values);
     case 'space': return cmdSpace(values, positionals);
     case 'move': return cmdMove(values, positionals);
-    case 'index': return cmdIndex(values);
-    case 'lint': return cmdLint(values);
-    case 'search': return cmdSearch(values, positionals);
+    case 'index': return timed('index', () => cmdIndex(values));
+    case 'lint': return timed('lint', () => cmdLint(values));
+    case 'search': return timed('search', () => cmdSearch(values, positionals));
     case 'secret': return cmdSecret(values, positionals);
-    case 'roots': return cmdRoots(values);
+    case 'roots': return timed('roots', () => cmdRoots(values));
+    case 'timing': return cmdTiming(values);
+    case 'stage-commit': return timed('stage-commit', () => cmdStageCommit(values));
+    case 'quick': return timed('quick', () => cmdQuick(values));
     case 'probe': return cmdProbe(values);
     case 'promote': return cmdPromote(values, positionals);
     case 'repo-check': return cmdRepoCheck(values);
     case 'shelf': return cmdShelf(values);
     default:
-      console.error('usage: mindmate.mjs <init|init-project|space|move|index|lint|search|secret|roots|probe|promote|repo-check|shelf> [options]');
+      console.error('usage: mindmate.mjs <init|init-project|space|move|index|lint|search|secret|roots|probe|timing|stage-commit|quick|promote|repo-check|shelf> [options]');
       console.error('  init [--apply]  |  init-project --project <repo-dir> [--roots shared|local|both] [--apply]');
       console.error('  space --list | --create <slug> | --rename <old> <new> | --delete <name>');
       console.error('  move --from <space> --to <space> --files <doc.md> [--files ...] [--apply]');
