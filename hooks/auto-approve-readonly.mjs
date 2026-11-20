@@ -83,19 +83,26 @@ function firstMatch(rules, text) {
   return rules.find(r => r.re.test(text)) || null;
 }
 
-// 解封装：剥离 PowerShell(& 'exe' -c 'script') / bash -c "..." 外壳，取内层真实命令。
-// 例：& <bash.exe> -c 'export LC_ALL=C; ls -la tmp/'
-//     -> export LC_ALL=C; ls -la tmp/
-// 最多解 5 层，防异常输入死循环。
+// 解封装：先剥 PowerShell 前导调用操作符 & （& <exe> <args> -> <exe> <args>），
+// 再剥 <exe> -c <script> 外壳取内层真实命令。两种可叠加：
+//   & 'bash.exe' -c 'echo hi' -> echo hi      （先剥 &，再剥 -c）
+//   bash.exe -c 'echo hi'     -> echo hi      （直接 -c）
+//   & 'herdr-app.exe' status  -> herdr-app.exe status  （只剥 &）
+// & 只在行首剥，2>&1 里的 & 不受影响。最多解 5 层，防异常输入死循环。
 function unwrapShell(input) {
   let s = input.trim();
   // 兼容把 PowerShell(...) 外壳也传进来的情况
   const wrap = s.match(/^PowerShell\(([\s\S]*)\)$/i);
   if (wrap) s = wrap[1].trim();
   for (let i = 0; i < 5; i++) {
-    const m = s.match(/^&\s+(?:(['"])(.*?)\1|(\S+))\s+-(?:c|Command)\s+(['"])([\s\S]*)\4\s*$/i);
-    if (!m) break;
-    s = m[5].trim();
+    let changed = false;
+    // 1) 剥前导调用操作符 &
+    const amp = s.match(/^&\s+(.+)$/);
+    if (amp) { s = amp[1].trim(); changed = true; }
+    // 2) 剥 <exe> -c <script>（& 可能已在 1 剥掉，也可能本就是直接的 exe -c）
+    const m = s.match(/^(?:(['"])(.*?)\1|(\S+))\s+-(?:c|Command)\s+(['"])([\s\S]*)\4\s*$/i);
+    if (m) { s = m[5].trim(); changed = true; }
+    if (!changed) break;
   }
   return s;
 }
