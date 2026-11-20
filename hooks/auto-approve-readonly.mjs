@@ -92,10 +92,16 @@ function unwrapOne(input) {
     let changed = false;
     const amp = s.match(/^&\s+(.+)$/);
     if (amp) { s = amp[1].trim(); changed = true; }
-    // -c / -Command 大小写敏感：git 的 -C（大写）不能当 shell 封装误剥。
-    // 去掉 i 标志后，bash.exe -c / powershell -Command 仍匹配，git -C "$R" 不再匹配。
+    // -c / -Command 大小写敏感；且仅当 exe 是已知 shell 时才当封装解包。
+    // 避免把 grep -c "x"、git -C <path> 等合法 -c/-C 选项误当脚本封装。
     const m = s.match(/^(?:(['"])(.*?)\1|(\S+))\s+-(?:c|Command)\s+(['"])([\s\S]*)\4\s*$/);
-    if (m) { s = m[5].trim(); changed = true; }
+    if (m) {
+      const exe = (m[2] || m[3] || '').split(/[\\/]/).pop().replace(/\.exe$/i, '').toLowerCase();
+      if (/^(?:bash|sh|dash|zsh|cmd|powershell|pwsh)$/.test(exe)) {
+        s = m[5].trim();
+        changed = true;
+      }
+    }
     if (!changed) break;
   }
   return s;
