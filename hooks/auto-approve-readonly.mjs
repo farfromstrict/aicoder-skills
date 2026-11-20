@@ -92,7 +92,9 @@ function unwrapOne(input) {
     let changed = false;
     const amp = s.match(/^&\s+(.+)$/);
     if (amp) { s = amp[1].trim(); changed = true; }
-    const m = s.match(/^(?:(['"])(.*?)\1|(\S+))\s+-(?:c|Command)\s+(['"])([\s\S]*)\4\s*$/i);
+    // -c / -Command 大小写敏感：git 的 -C（大写）不能当 shell 封装误剥。
+    // 去掉 i 标志后，bash.exe -c / powershell -Command 仍匹配，git -C "$R" 不再匹配。
+    const m = s.match(/^(?:(['"])(.*?)\1|(\S+))\s+-(?:c|Command)\s+(['"])([\s\S]*)\4\s*$/);
     if (m) { s = m[5].trim(); changed = true; }
     if (!changed) break;
   }
@@ -436,7 +438,9 @@ function stripHarmlessRedir(s) {
   let r = s
     .replace(/[12]?>\s*&\s*[12]\b/g, '')
     .replace(/&>\s*\/dev\/null\b/g, '')
-    .replace(/[12]?>\s*\/dev\/null\b/g, '');
+    .replace(/[12]?>\s*\/dev\/null\b/g, '')
+    // PowerShell 丢弃输出：| Out-Null（等价 >/dev/null），连同前导管道一并剥离
+    .replace(/\s*\|\s*Out-Null\b/gi, '');
   // 逐段处理写重定向（> / >>），命中 write_allow 才剥离
   r = splitSegments(r).map(seg => {
     const wt = extractWriteTarget(seg);
