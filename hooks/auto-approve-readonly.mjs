@@ -278,7 +278,7 @@ const REASON = {
   DENY_SEG: 'DENY_SEG',
   DENY_VETO: 'DENY_VETO',
   ASK_OPERATOR_PIPE: 'ASK_OPERATOR_PIPE',
-  ASK_OPERATOR_REDIRECT: 'ASK_OPERATOR_REDIRECT',
+  ASK_FILE_WRITE: 'ASK_FILE_WRITE',
   ASK_OPERATOR_SUBST: 'ASK_OPERATOR_SUBST',
   ASK_EXTERNAL_CALL: 'ASK_EXTERNAL_CALL',
   ASK_COMPLEX: 'ASK_COMPLEX',
@@ -522,10 +522,12 @@ const opMatch = normalizedForCheck.match(/[|&`><]|\$\(/);
 if (opMatch) {
   const op = opMatch[0];
   const opReason = op === '|' ? REASON.ASK_OPERATOR_PIPE
-    : op === '>' || op === '<' ? REASON.ASK_OPERATOR_REDIRECT
+    : op === '>' || op === '<' ? REASON.ASK_FILE_WRITE
     : op === '&' ? REASON.ASK_EXTERNAL_CALL
     : REASON.ASK_OPERATOR_SUBST; // ` 或 $(
-  decision('ask', opReason, '⚠️ 包含管道/重定向等运算符，无法自动分析');
+  const opText = op === '>' || op === '<' ? '⚠️ 命令包含写文件操作，未在白名单'
+    : '⚠️ 包含管道/重定向等运算符，无法自动分析';
+  decision('ask', opReason, opText);
   process.exit(0);
 }
 
