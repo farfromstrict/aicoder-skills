@@ -189,8 +189,9 @@ function stripQuoted(s) {
   return s.replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""');
 }
 
-// 复杂结构：PowerShell 控制流关键词（引号外）、{} 脚本块、多行
-const COMPLEX_RE = /\b(for|foreach|while|do|if|elseif|switch|function|filter|trap|try|catch|finally|param|begin|process|end)\b/i;
+// 复杂结构：PowerShell 控制流关键词（引号外）、{} 脚本块、多行。
+// 注意：do 不列入——它是 herdr-app.exe 的子命令（do xxx），真正的 do-while 循环必带 {} 已被上面覆盖。
+const COMPLEX_RE = /\b(for|foreach|while|if|elseif|switch|function|filter|trap|try|catch|finally|param|begin|process|end)\b/i;
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
@@ -310,10 +311,11 @@ function decision(level, reasonCode, reasonText) {
   process.stdout.write(json);
 }
 
-// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 按 write_allow 剥离无害写重定向
+// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 按 write_allow 剥离无害写重定向 → 安全管道归一化
 let cmd = unwrapShell(rawCmd);
 cmd = resolveVars(cmd);
 cmd = stripHarmlessRedir(cmd);
+cmd = normalizeSafePipes(cmd);
 
 if (userLayer.mode === 'allow-all') {
   decision('allow', REASON.ALLOW_MODE_ALL, '✅ mode=allow-all：全部放行');
@@ -380,9 +382,43 @@ function stripHarmlessRedir(s) {
   return r;
 }
 
+// 单段是否安全（供安全管道判定用）：命中 deny→false；safe/allow→true；其余 false。
+function isSegSafe(s) {
+  if (firstMatch(projDeny, s) || firstMatch(denyRules, s)) return false;
+  if (isSafeSegment(s)) return true;
+  if (firstMatch(projAllow, s) || firstMatch(allowRules, s)) return true;
+  return false;
+}
+
+// 引号感知地按单 | 拆管道（忽略 || 和引号内的 |）
+function splitPipes(cmd) {
+  const parts = [];
+  let cur = '';
+  let quote = '';
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (quote) { cur += ch; if (ch === quote) quote = ''; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === '|' && cmd[i + 1] !== '|') { parts.push(cur); cur = ''; continue; }
+    cur += ch;
+  }
+  parts.push(cur);
+  return parts.map(s => s.trim()).filter(Boolean);
+}
+
+// 安全管道归一化：把含 | 的命令按 | 和 ; 拆段，若所有段都安全，则把 | 当 ; 放行；
+// 否则保留 |，让下面的运算符检查拦下。这样只读过滤链（grep|head、Get-Content|ConvertFrom-Json）可自动通过。
+function normalizeSafePipes(s) {
+  if (!s.includes('|') || s.includes('||')) return s;
+  const parts = splitPipes(s).flatMap(p => splitSegments(p)).filter(Boolean);
+  if (parts.length && parts.every(isSegSafe)) return parts.join('; ');
+  return s;
+}
+
 // 1. 管道/重定向/反引号/命令替换/单 & 调用操作符 → ask（按运算符类型细分 reason）
-// cmd 已在预处理链剥离无害重定向（2>&1、Out-File 到 Temp 等），这里检查剩余的真运算符。
-const normalizedForCheck = cmd.split('&&').join(';').split('||').join(';');
+// cmd 已在预处理链剥离无害重定向（2>&1、Out-File 到 Temp）并归一化安全管道，这里检查剩余的真运算符。
+// 用 stripQuoted 去掉引号内内容，避免把 -Pattern "a|b" 这类引号内的 | <> 误判为运算符。
+const normalizedForCheck = stripQuoted(cmd.split('&&').join(';').split('||').join(';'));
 const opMatch = normalizedForCheck.match(/[|&`><]|\$\(/);
 if (opMatch) {
   const op = opMatch[0];
