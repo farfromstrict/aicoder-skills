@@ -279,6 +279,7 @@ const REASON = {
   DENY_VETO: 'DENY_VETO',
   ASK_OPERATOR_PIPE: 'ASK_OPERATOR_PIPE',
   ASK_FILE_WRITE: 'ASK_FILE_WRITE',
+  ASK_FILE_DELETE: 'ASK_FILE_DELETE',
   ASK_OPERATOR_SUBST: 'ASK_OPERATOR_SUBST',
   ASK_EXTERNAL_CALL: 'ASK_EXTERNAL_CALL',
   ASK_COMPLEX: 'ASK_COMPLEX',
@@ -556,6 +557,7 @@ const results = segs.map((seg, i) => {
   if (/^(['"]).*\1$/.test(segT)) return { kind: 'safe', seg, i };
   if (isSafeSegment(segT)) return { kind: 'safe', seg, i };
   // 删除目标命中 delete_allow（如 Temp）→ safe（多文件时全部命中才放行）
+  let deleteBlocked = false;
   const dt = extractDeleteTarget(segT);
   if (dt) {
     const allAllowed = dt.targets.every(t => firstMatch(projDelete, t) || firstMatch(deleteRules, t));
@@ -566,6 +568,7 @@ const results = segs.map((seg, i) => {
       }
       return { kind: 'safe', seg, i };
     }
+    deleteBlocked = true; // 删除操作但目标未命中 delete_allow
   }
   // 写命令目标命中 write_allow（如 Temp）→ safe（cp/mv/touch/mkdir/tee/Copy-Item/New-Item/Set-Content...）
   const ct = extractWriteCommandTarget(segT);
@@ -579,6 +582,8 @@ const results = segs.map((seg, i) => {
   if (w) return { kind: 'allow', seg, i, rule: w.rule };
   if (userLayer.mode === 'no-ask') return { kind: 'allow', seg, i, layer: '[用户级]', note: 'mode=no-ask' };
   if (userLayer.mode === 'allow-all') return { kind: 'allow', seg, i, layer: '[用户级]', note: 'mode=allow-all' };
+  // 删除操作但未命中 delete_allow → 独立分类，与写文件 ASK_FILE_WRITE 对齐
+  if (deleteBlocked) return { kind: 'del_block', seg, i, layer: '[默认]' };
   return { kind: 'unknown', seg, i, layer: '[默认]' };
 });
 // 收集逐段命中的规则（去重由 trackHit 内部 Set 完成）
@@ -615,9 +620,12 @@ if (results.every(r => r.kind === 'allow' || r.kind === 'safe')) {
 // 6. 提取失败段（只列有问题的段）
 const bad = results.filter(r => r.kind !== 'allow' && r.kind !== 'safe');
 const badDesc = bad.slice(0, 3).map(r => {
-  const label = (r.layer ? r.layer + ' ' : '') + (r.kind === 'ask' ? '命中 ask 规则' : '不在白名单');
+  const label = r.kind === 'del_block' ? '删除目标不在白名单'
+    : (r.layer ? r.layer + ' ' : '') + (r.kind === 'ask' ? '命中 ask 规则' : '不在白名单');
   return `第 ${r.i + 1} 段 [${truncate(r.seg, 50)}] ${label}`;
 });
 const more = bad.length > 3 ? `（另有 ${bad.length - 3} 段）` : '';
-const aReason = bad[0].kind === 'ask' ? REASON.ASK_RULE : REASON.ASK_UNKNOWN;
+const aReason = bad[0].kind === 'ask' ? REASON.ASK_RULE
+  : bad[0].kind === 'del_block' ? REASON.ASK_FILE_DELETE
+  : REASON.ASK_UNKNOWN;
 decision('ask', aReason, `⚠️ 需要确认：${badDesc.join('；')}${more}`);
