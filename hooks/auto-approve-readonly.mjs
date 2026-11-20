@@ -83,28 +83,46 @@ function firstMatch(rules, text) {
   return rules.find(r => r.re.test(text)) || null;
 }
 
-// 解封装：先剥 PowerShell 前导调用操作符 & （& <exe> <args> -> <exe> <args>），
-// 再剥 <exe> -c <script> 外壳取内层真实命令。两种可叠加：
-//   & 'bash.exe' -c 'echo hi' -> echo hi      （先剥 &，再剥 -c）
-//   bash.exe -c 'echo hi'     -> echo hi      （直接 -c）
-//   & 'herdr-app.exe' status  -> herdr-app.exe status  （只剥 &）
-// & 只在行首剥，2>&1 里的 & 不受影响。最多解 5 层，防异常输入死循环。
-function unwrapShell(input) {
+// 解封装单段：循环剥前导 & 和 <exe> -c <script>（两种可叠加）
+function unwrapOne(input) {
   let s = input.trim();
-  // 兼容把 PowerShell(...) 外壳也传进来的情况
-  const wrap = s.match(/^PowerShell\(([\s\S]*)\)$/i);
-  if (wrap) s = wrap[1].trim();
   for (let i = 0; i < 5; i++) {
     let changed = false;
-    // 1) 剥前导调用操作符 &
     const amp = s.match(/^&\s+(.+)$/);
     if (amp) { s = amp[1].trim(); changed = true; }
-    // 2) 剥 <exe> -c <script>（& 可能已在 1 剥掉，也可能本就是直接的 exe -c）
     const m = s.match(/^(?:(['"])(.*?)\1|(\S+))\s+-(?:c|Command)\s+(['"])([\s\S]*)\4\s*$/i);
     if (m) { s = m[5].trim(); changed = true; }
     if (!changed) break;
   }
   return s;
+}
+
+// 解封装：先按 ; && || 分段，逐段解包；解包后若内层又出现分隔符则递归再拆。
+// 例：
+//   & 'bash.exe' -c 'echo hi'           -> echo hi
+//   & 'bash.exe' -c 'echo hi; ls'       -> echo hi; ls        （内层 ; 递归拆）
+//   $p = "x.exe"; & $p --version        -> $p = "x.exe"; $p --version  （& 在段首被剥）
+// & 只在段首剥，2>&1 里的 & 不受影响。递归最多 5 层，防异常输入死循环。
+function unwrapShell(input, depth = 0) {
+  let s = input.trim();
+  if (depth === 0) {
+    const wrap = s.match(/^PowerShell\(([\s\S]*)\)$/i);
+    if (wrap) s = wrap[1].trim();
+  }
+  if (depth > 5) return unwrapOne(s);
+  const segs = splitSegments(s);
+  if (!segs.length) return '';
+  const out = [];
+  for (const seg of segs) {
+    const u = unwrapOne(seg);
+    // 仅当解包改变了内容且内层又出现分隔符时才递归，避免 (a; a) 这类无变化输入死循环
+    if (u !== seg && splitSegments(u).length > 1) {
+      out.push(unwrapShell(u, depth + 1));
+    } else {
+      out.push(u);
+    }
+  }
+  return out.join('; ');
 }
 
 // 安全段：切换目录 / 设置环境变量（无副作用；$env: 排除 PATH/GIT_ 开头/PSModulePath 等敏感变量）
