@@ -241,7 +241,11 @@ function stripQuoted(s) {
 //   - do / switch 不列入——它们是命令子命令（herdr do xxx、git switch），真正的 do-while / switch
 //     语句必带 {} 已被 hasScriptBlock 覆盖。
 //   - if/elseif 要求后跟 '('（PowerShell 语法 if (...)），避免误判 dd 的 if= 参数。
-const COMPLEX_RE = /(\bfor\b|\bforeach\b|\bwhile\b|\bif\s*\(|\belseif\s*\(|\bfunction\b|\bfilter\b|\btrap\b|\btry\b|\bcatch\b|\bfinally\b|\bparam\b|\bbegin\b|\bprocess\b|\bend\b)/i;
+// 循环结构（for/foreach/while）：与代码块分开 reason，提示聚焦循环体。
+const LOOP_RE = /(\bfor\b|\bforeach\b|\bwhile\b)/i;
+// 其他复杂结构：脚本块由 hasScriptBlock 覆盖；控制流关键字（if/function/try...）归代码块。
+// 注意 if/elseif 要求后跟 '('，避免误判 dd 的 if= 参数。
+const COMPLEX_RE = /(\bif\s*\(|\belseif\s*\(|\bfunction\b|\bfilter\b|\btrap\b|\btry\b|\bcatch\b|\bfinally\b|\bparam\b|\bbegin\b|\bprocess\b|\bend\b)/i;
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
@@ -322,6 +326,7 @@ const REASON = {
   ASK_FILE_DELETE: 'ASK_FILE_DELETE',
   ASK_OPERATOR_SUBST: 'ASK_OPERATOR_SUBST',
   ASK_EXTERNAL_CALL: 'ASK_EXTERNAL_CALL',
+  ASK_LOOP: 'ASK_LOOP',
   ASK_COMPLEX: 'ASK_COMPLEX',
   ASK_RULE: 'ASK_RULE',
   ASK_UNKNOWN: 'ASK_UNKNOWN',
@@ -462,6 +467,49 @@ function expandIfBlocks(s) {
   return out;
 }
 
+// ---- for 循环展开（受限支持、保守）----
+// 支持形态：for <var> in <item1> <item2> ...; do <body>; done
+// 展开：把 body 里每个 $var 按列表值替换，生成 N 份 body 顺序执行，复用逐段分析。
+// 保守拒绝（保留原样 → ASK_LOOP）：嵌套循环、列表项含特殊字符/引号、控制流、迭代 >20、
+// 找不到配对 done、变量引用形态异常。不能判断一律 ask。
+function findKeyword(s, from, kw) {
+  // 引号感知地找独立关键字（词边界）
+  let quote = '';
+  const re = new RegExp('\\b' + kw + '\\b', 'g');
+  for (let i = from; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { if (ch === quote) { if (s[i + 1] === quote) { i++; } else quote = ''; } continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (m && m.index === i) return i;
+  }
+  return -1;
+}
+
+function expandForLoops(s) {
+  const re = /\bfor\s+([A-Za-z_]\w*)\s+in\s+([^;]+?)\s*[;]\s*do\b/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(s)) !== null) {
+    const varName = m[1];
+    const items = m[2].trim().split(/\s+/).filter(Boolean);
+    // 列表项必须是简单字面量（无特殊字符/引号/变量/命令替换）
+    if (!items.length || items.length > 20 || items.some(x => /[$`'"><|&{};\\]/.test(x))) continue;
+    const doneIdx = findKeyword(s, re.lastIndex, 'done');
+    if (doneIdx < 0) continue;
+    const body = s.slice(re.lastIndex, doneIdx);
+    // body 内嵌套循环/控制流/脚本块 → 保守拒绝
+    if (/\b(?:for|foreach|while|if|switch|function)\b/.test(body) || /[{}]/.test(stripQuoted(body))) continue;
+    // 替换 $var（含 $var 后紧跟标点，如 $f.java）
+    const expansions = items.map(v => body.replace(new RegExp('\\$' + varName + '\\b', 'g'), v));
+    out += s.slice(last, m.index) + expansions.join('; ');
+    last = doneIdx + 4; // done 长度
+    re.lastIndex = last;
+  }
+  out += s.slice(last);
+  return out;
+}
+
 // 剥离 bash 命令组边界：{ cmd1; cmd2; } 语义等价于 cmd1; cmd2，边界 { } 无独立语义。
 // 仅剥"段首的 { "和"段尾的 }"（命令组语法）；嵌在命令里的 {（如 ForEach-Object { ... }）保留，
 // 由 COMPLEX_RE 继续判定为脚本块。
@@ -477,11 +525,12 @@ function stripGroupBraces(s) {
   }).filter(Boolean).join('; ');
 }
 
-// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 脚本文件展开 → if块展开 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
+// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 脚本文件展开 → if块展开 → for循环展开 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
 let cmd = unwrapShell(rawCmd);
 cmd = resolveVars(cmd);
 cmd = expandScriptFiles(cmd);
 cmd = expandIfBlocks(cmd);
+cmd = expandForLoops(cmd);
 cmd = stripHarmlessRedir(cmd);
 cmd = normalizeSafePipes(cmd);
 cmd = stripGroupBraces(cmd);
@@ -680,8 +729,12 @@ function hasScriptBlock(s) {
 // 比管道/重定向等运算符更根本，故优先于下面的运算符检查（给出更准的 reason）。
 // 用 stripQuoted 去掉引号内内容，避免把管道传入的 JSON 字符串（含 {}）误判为脚本块。
 const cmdNoQuoted = stripQuoted(cmd);
+if (LOOP_RE.test(cmdNoQuoted)) {
+  decision('ask', REASON.ASK_LOOP, '⚠️ 循环体内存在无法可靠分析的操作，请人工审查');
+  process.exit(0);
+}
 if (/[\r\n]/.test(cmd) || hasScriptBlock(cmd) || COMPLEX_RE.test(cmdNoQuoted)) {
-  decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含循环/脚本块等复杂结构，无法自动分析，请人工审查');
+  decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含脚本块/控制流等复杂结构，无法自动分析，请人工审查');
   process.exit(0);
 }
 
