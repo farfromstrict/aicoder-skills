@@ -469,9 +469,10 @@ function stripGroupBraces(s) {
   return splitSegments(s).map(seg => {
     let t = seg.trim();
     if (/^\{\s+/.test(t)) t = t.replace(/^\{\s+/, '');  // 段首 {（bash 命令组）
-    // 注意：只处理"纯 } 段"（bash 命令组被拆开后的边界），不剥段尾 } ——
-    // if (...) { ... } 的 } 与内容同段，剥掉会留下悬空 { 破坏结构。
-    if (t === '{' || t === '}') t = '';
+    // 段尾 } 一并剥：此时 if/elseif/else 语句已由 expandIfBlocks 在前面展开消失，
+    // 段尾 } 只可能来自 bash 命令组 { ...; } 的结尾，与安全段尾剥离无冲突。
+    if (/\s+\}$/.test(t)) t = t.replace(/\s+\}$/, '');
+    if (t === '{' || t === '}') t = '';                   // 纯边界段
     return t;
   }).filter(Boolean).join('; ');
 }
