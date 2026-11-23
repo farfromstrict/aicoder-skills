@@ -660,6 +660,8 @@ function stripHarmlessRedir(s) {
     .replace(/[12]?>\s*&\s*[12]\b/g, '')
     .replace(/&>\s*\/dev\/null\b/g, '')
     .replace(/[12]?>\s*\/dev\/null\b/g, '')
+    // PowerShell 丢弃输出：$null（等价 /dev/null），如 2>$null / >$null / &>$null
+    .replace(/&?\s*[12]?>\s*\$null\b/gi, '')
     // PowerShell 丢弃输出：| Out-Null（等价 >/dev/null），连同前导管道一并剥离
     .replace(/\s*\|\s*Out-Null\b/gi, '');
   // 逐段处理写重定向（> / >>），命中 write_allow 才剥离
