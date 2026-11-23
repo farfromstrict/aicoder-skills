@@ -511,6 +511,42 @@ function expandForLoops(s) {
   return out;
 }
 
+// PowerShell foreach 展开：foreach ($v in @("a","b")) { body } → body 按值替换后顺序展开。
+// 与 bash for 同样保守：列表仅简单字面量、body 禁嵌套/控制流、迭代 ≤20、括号配对失败则保留 → ASK_LOOP。
+function expandPowerShellForeach(s) {
+  const re = /\bforeach\s*\(/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(s)) !== null) {
+    const open = s.indexOf('(', m.index);
+    const close = matchBalanced(s, open, '(', ')');
+    if (close < 0) continue;
+    const hm = s.slice(open + 1, close).match(/^\s*\$([A-Za-z_]\w*)\s+in\s+([\s\S]+)$/);
+    if (!hm) continue;
+    const [, varName, listExpr0] = hm;
+    let listExpr = listExpr0.trim();
+    // @("a","b") → 去 @( )
+    if (/^@\([\s\S]*\)$/.test(listExpr)) listExpr = listExpr.slice(2, -1);
+    // 提取列表项：引号字符串优先，否则逗号/空白分隔的裸 token
+    let items = [...listExpr.matchAll(/(['"])(.*?)\1/g)].map(x => x[2]);
+    if (!items.length) items = listExpr.split(/[,\s]+/).filter(Boolean);
+    if (!items.length || items.length > 20 || items.some(x => /[$`'"><|&{};\\]/.test(x))) continue;
+    // 找 body 的 { }
+    let pos = close + 1;
+    while (pos < s.length && /\s/.test(s[pos])) pos++;
+    if (s[pos] !== '{') continue;
+    const closeBrace = matchBalanced(s, pos, '{', '}');
+    if (closeBrace < 0) continue;
+    const body = s.slice(pos + 1, closeBrace);
+    if (/\b(?:for|foreach|while|if|switch|function)\b/.test(body) || /[{}]/.test(stripQuoted(body))) continue;
+    const expansions = items.map(v => body.replace(new RegExp('\\$' + varName + '\\b', 'g'), v));
+    out += s.slice(last, m.index) + expansions.join('; ');
+    last = closeBrace + 1;
+    re.lastIndex = last;
+  }
+  out += s.slice(last);
+  return out;
+}
+
 // 剥离 bash 命令组边界：{ cmd1; cmd2; } 语义等价于 cmd1; cmd2，边界 { } 无独立语义。
 // 仅剥"段首的 { "和"段尾的 }"（命令组语法）；嵌在命令里的 {（如 ForEach-Object { ... }）保留，
 // 由 COMPLEX_RE 继续判定为脚本块。
@@ -532,6 +568,7 @@ cmd = resolveVars(cmd);
 cmd = expandScriptFiles(cmd);
 cmd = expandIfBlocks(cmd);
 cmd = expandForLoops(cmd);
+cmd = expandPowerShellForeach(cmd);
 cmd = stripHarmlessRedir(cmd);
 cmd = normalizeSafePipes(cmd);
 cmd = stripGroupBraces(cmd);
