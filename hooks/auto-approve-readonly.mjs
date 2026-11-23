@@ -368,9 +368,10 @@ function decision(level, reasonCode, reasonText) {
 function stripGroupBraces(s) {
   return splitSegments(s).map(seg => {
     let t = seg.trim();
-    if (/^\{\s+/.test(t)) t = t.replace(/^\{\s+/, '');  // 段首 {
-    if (/\s+\}$/.test(t)) t = t.replace(/\s+\}$/, '');  // 段尾 }
-    if (t === '{' || t === '}') t = '';                   // 纯边界段
+    if (/^\{\s+/.test(t)) t = t.replace(/^\{\s+/, '');  // 段首 {（bash 命令组）
+    // 注意：只处理"纯 } 段"（bash 命令组被拆开后的边界），不剥段尾 } ——
+    // if (...) { ... } 的 } 与内容同段，剥掉会留下悬空 { 破坏结构。
+    if (t === '{' || t === '}') t = '';
     return t;
   }).filter(Boolean).join('; ');
 }
