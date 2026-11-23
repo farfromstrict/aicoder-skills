@@ -16,7 +16,7 @@
  */
 import { readFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 
 // 参数：argv 可为 <configPath>、--mode <mode>、--rules <json>；hook 正常调用时不传，走默认。
 const ARGS = process.argv.slice(2);
@@ -142,16 +142,55 @@ function resolveVars(cmd) {
   const vars = new Map();
   const out = [];
   for (const seg of segs) {
-    const m = seg.match(/^\$([A-Za-z_]\w*)\s*=\s*(['"])(.*?)\2\s*$/);
+    // 同时识别 PowerShell($S=) 与 bash(S=) 变量赋值；引用统一用 $name / "$name"
+    const m = seg.match(/^\$?([A-Za-z_]\w*)\s*=\s*(['"])(.*?)\2\s*$/);
     if (m) {
-      vars.set(m[1], m[2] + m[3] + m[2]); // 保留引号，如 "C:\...\herdr-app.exe"
+      // 保存去引号的裸值；替换时根据 $var 是否已被引号包裹决定是否补引号
+      vars.set(m[1], m[3]);
       continue; // 赋值段本身仍保留，交给 isSafeSegment 判定
     }
     let resolved = seg;
     for (const [name, value] of vars) {
-      resolved = resolved.replace(new RegExp('\\$' + name + '\\b', 'g'), value);
+      // "$var" / '$var' 已在引号内 → 用裸值，避免双引号叠加 ""path""
+      resolved = resolved.replace(new RegExp("(['\"])\\$" + name + "\\b\\1", 'g'), '$1' + value + '$1');
+      // 裸 $var → 补引号（保留含空格路径的完整性）
+      resolved = resolved.replace(new RegExp('\\$' + name + '\\b', 'g'), '"' + value + '"');
     }
     out.push(resolved);
+  }
+  return out.join('; ');
+}
+
+// 脚本文件展开：bash/sh/source/. <script>、powershell/pwsh -File <script> 时读取脚本内容，
+// 当作内联命令展开，复用现有逐段分析。与直接 bash -c '...' 等价。
+// 读不到 / 空内容 / 超深度 → 保留原段（落到 ask，fail-safe）。
+function expandScriptFiles(s, depth = 0) {
+  if (depth > 5) return s;
+  const segs = splitSegments(s);
+  const out = [];
+  for (const seg of segs) {
+    const t = seg.trim();
+    // 识别 shell 脚本调用：bash/sh/dash/zsh [选项] <script>  或  source/. <script>
+    let m = t.match(/^(?:bash|sh|dash|zsh)\s+(?:-[a-z]+\s+)*['"]?([^'"\s]+)['"]?\s*$/i)
+      || t.match(/^(?:source|\.)\s+['"]?([^'"\s]+)['"]?\s*$/i);
+    // PowerShell: powershell/pwsh -File <script>（也支持 -f）
+    if (!m) m = t.match(/^(?:powershell|pwsh)\s+-(?:File|f)\s+['"]?([^'"\s]+)['"]?\s*$/i);
+    if (!m) { out.push(seg); continue; }
+    let scriptPath = m[1];
+    try {
+      scriptPath = resolve(process.cwd(), scriptPath.replace(/^['"]|['"]$/g, ''));
+      if (!existsSync(scriptPath)) { out.push(seg); continue; }
+      let content = readFileSync(scriptPath, 'utf8').replace(/^\uFEFF/, '');
+      // 去 shebang 与整行注释（bash/ps 的 # 注释；保留行内 #）
+      // 换行是语句分隔符，转成 ; 后再交给现有拆段逻辑（否则触发多行 COMPLEX 检查）
+      content = content.split('\n').filter(line => !/^\s*#/.test(line)).join('; ').trim();
+      if (!content) { out.push(seg); continue; }
+      // 脚本内容当作内联命令：解封装 + 递归展开（脚本里再调脚本）
+      const expanded = expandScriptFiles(unwrapShell(content), depth + 1);
+      out.push(expanded);
+    } catch {
+      out.push(seg); // 读失败 → 保留原段 → ask
+    }
   }
   return out.join('; ');
 }
@@ -336,9 +375,10 @@ function stripGroupBraces(s) {
   }).filter(Boolean).join('; ');
 }
 
-// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
+// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 脚本文件展开 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
 let cmd = unwrapShell(rawCmd);
 cmd = resolveVars(cmd);
+cmd = expandScriptFiles(cmd);
 cmd = stripHarmlessRedir(cmd);
 cmd = normalizeSafePipes(cmd);
 cmd = stripGroupBraces(cmd);
