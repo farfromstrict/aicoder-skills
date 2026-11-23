@@ -738,8 +738,8 @@ if (/[\r\n]/.test(cmd) || hasScriptBlock(cmd) || COMPLEX_RE.test(cmdNoQuoted)) {
   process.exit(0);
 }
 
-// 2. 管道/重定向/反引号/命令替换/单 & 调用操作符 → ask（按运算符类型细分 reason）
-// cmd 已在预处理链剥离无害重定向（2>&1、Out-File 到 Temp）并归一化安全管道，这里检查剩余的真运算符。
+// 2. 剩余真运算符 → ask。cmd 已剥离无害重定向（2>&1、Out-File Temp）、归一化安全管道，
+// 能走到这里的：管道=至少一段不在白名单；重定向=写文件到非白名单路径；&/命令替换=无法静态分析。
 // 用 stripQuoted 去掉引号内内容，避免把 -Pattern "a|b" 这类引号内的 | <> 误判为运算符。
 const normalizedForCheck = stripQuoted(cmd.split('&&').join(';').split('||').join(';'));
 const opMatch = normalizedForCheck.match(/[|&`><]|\$\(/);
@@ -749,8 +749,10 @@ if (opMatch) {
     : op === '>' || op === '<' ? REASON.ASK_FILE_WRITE
     : op === '&' ? REASON.ASK_EXTERNAL_CALL
     : REASON.ASK_OPERATOR_SUBST; // ` 或 $(
-  const opText = op === '>' || op === '<' ? '⚠️ 命令包含写文件操作，未在白名单'
-    : '⚠️ 包含管道/重定向等运算符，无法自动分析';
+  const opText = op === '|' ? '⚠️ 管道中的命令存在不在白名单的操作'
+    : op === '>' || op === '<' ? '⚠️ 命令包含写文件操作，未在白名单'
+    : op === '&' ? '⚠️ 调用了外部程序，无法分析其行为'
+    : '⚠️ 包含命令替换，无法静态分析';
   decision('ask', opReason, opText);
   process.exit(0);
 }
