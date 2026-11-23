@@ -239,14 +239,14 @@ function stripQuoted(s) {
 
 // 复杂结构：PowerShell 控制流关键词（引号外）、{} 脚本块、多行。
 // 注意：
-//   - do / switch 不列入——它们是命令子命令（herdr do xxx、git switch），真正的 do-while / switch
-//     语句必带 {} 已被 hasScriptBlock 覆盖。
+//   - do / switch / filter 不列入——它们是命令子命令或 cmdlet 参数（herdr do xxx、git switch、
+//     Get-ChildItem -Filter），真正的 do-while / switch / filter 块必带 {} 已被 hasScriptBlock 覆盖。
 //   - if/elseif 要求后跟 '('（PowerShell 语法 if (...)），避免误判 dd 的 if= 参数。
 // 循环结构（for/foreach/while）：与代码块分开 reason，提示聚焦循环体。
 const LOOP_RE = /(\bfor\b|\bforeach\b|\bwhile\b)/i;
 // 其他复杂结构：脚本块由 hasScriptBlock 覆盖；控制流关键字（if/function/try...）归代码块。
 // 注意 if/elseif 要求后跟 '('，避免误判 dd 的 if= 参数。
-const COMPLEX_RE = /(\bif\s*\(|\belseif\s*\(|\bfunction\b|\bfilter\b|\btrap\b|\btry\b|\bcatch\b|\bfinally\b|\bparam\b|\bbegin\b|\bprocess\b|\bend\b)/i;
+const COMPLEX_RE = /(\bif\s*\(|\belseif\s*\(|\bfunction\b|\btrap\b|\btry\b|\bcatch\b|\bfinally\b|\bparam\b|\bbegin\b|\bprocess\b|\bend\b)/i;
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
