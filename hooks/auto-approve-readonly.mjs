@@ -666,10 +666,23 @@ function stripHarmlessRedir(s) {
     .replace(/\s*\|\s*Out-Null\b/gi, '');
   // 逐段处理写重定向（> / >>），命中 write_allow 才剥离
   r = splitSegments(r).map(seg => {
+    // 先处理 Out-File -FilePath
     const wt = extractWriteTarget(seg);
-    if (!wt) return seg;
-    const m = firstMatch(projWrite, wt.target) || firstMatch(writeRules, wt.target);
-    if (m) { trackHit('write_allow', m.rule); return seg.replace(wt.re, ''); }
+    if (wt && wt.re && wt.re.source.includes('Out-File')) {
+      const m = firstMatch(projWrite, wt.target) || firstMatch(writeRules, wt.target);
+      if (m) { trackHit('write_allow', m.rule); return seg.replace(wt.re, ''); }
+      return seg;
+    }
+    // 处理段内所有 > / >> 重定向（如 `cmd > out.txt 2> err.txt`）：全部命中才全部剥离
+    const redirRe = />>?\s+(?:(['"])(.*?)\1|([^\s'">|;]+))/g;
+    const matches = [...seg.matchAll(redirRe)];
+    if (!matches.length) return seg;
+    const targets = matches.map(m => m[2] ?? m[3]);
+    const hits = targets.map(t => firstMatch(projWrite, t) || firstMatch(writeRules, t));
+    if (hits.every(Boolean)) {
+      hits.forEach(h => trackHit('write_allow', h.rule));
+      return seg.replace(redirRe, '').trim();
+    }
     return seg;
   }).join('; ');
   return r;
