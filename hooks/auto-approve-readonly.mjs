@@ -142,11 +142,12 @@ function resolveVars(cmd) {
   const vars = new Map();
   const out = [];
   for (const seg of segs) {
-    // 同时识别 PowerShell($S=) 与 bash(S=) 变量赋值；引用统一用 $name / "$name"
-    const m = seg.match(/^\$?([A-Za-z_]\w*)\s*=\s*(['"])(.*?)\2\s*$/);
+    // 同时识别 PowerShell($S=) 与 bash(S=) 变量赋值；值支持引号包裹或裸字面量（无空白/特殊字符）
+    const m = seg.match(/^\$?([A-Za-z_]\w*)\s*=\s*(['"])(.*?)\2\s*$/)
+      || seg.match(/^\$?([A-Za-z_]\w*)\s*=\s*([^\s'";|&`()<>]+)\s*$/);
     if (m) {
-      // 保存去引号的裸值；替换时根据 $var 是否已被引号包裹决定是否补引号
-      vars.set(m[1], m[3]);
+      // 保存裸值；替换时根据 $var 是否已在引号内决定是否补引号
+      vars.set(m[1], m[3] ?? m[2]);
       continue; // 赋值段本身仍保留，交给 isSafeSegment 判定
     }
     let resolved = seg;
@@ -619,10 +620,16 @@ function extractWriteCommandTarget(seg) {
     const of = s.match(/\bof\s*=\s*['"]?([^'"\s]+)['"]?/i);
     return of ? { target: of[1] } : null;
   }
-  // tar：cf <archive>
+  // tar：写归档 cf <archive>；解压 -x -C <dir>（写目标目录）
   if (cmd === 'tar') {
     const cf = s.match(/\b[cz][xf]\s+['"]?([^'"\s]+)['"]?/i);
-    return cf ? { target: cf[1] } : null;
+    if (cf) return { target: cf[1] };
+    // 解压：tar -x ... -C <dir> → 写目标是 -C 后的目录
+    if (/\s-x\b/i.test(s)) {
+      const C = s.match(/-C\s+['"]?([^'"\s]+)['"]?/i);
+      if (C) return { target: C[1] };
+    }
+    return null;
   }
   // Out-File -FilePath（已由 extractWriteTarget 处理重定向剥离，这里也支持独立命令形态）
   if (cmd === 'out-file') {
@@ -682,6 +689,11 @@ function isSegSafe(s) {
   if (/^(['"]).*\1$/.test(t)) return true;
   if (isSafeSegment(t)) return true;
   if (firstMatch(projAllow, t) || firstMatch(allowRules, t)) return true;
+  // 写/删除目标命中白名单（如 cp/tar 到 Temp）→ 安全管道段
+  const wt = extractWriteCommandTarget(t);
+  if (wt && (firstMatch(projWrite, wt.target) || firstMatch(writeRules, wt.target))) return true;
+  const dt = extractDeleteTarget(t);
+  if (dt && dt.targets.every(x => firstMatch(projDelete, x) || firstMatch(deleteRules, x))) return true;
   return false;
 }
 
