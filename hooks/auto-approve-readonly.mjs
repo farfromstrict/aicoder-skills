@@ -824,7 +824,8 @@ if (opMatch) {
   // 细化提示：定位具体段/目标，便于用户判断
   let detail = '';
   if (op === '|') {
-    const bad = splitPipes(cmd).filter(p => p.trim() && !isSegSafe(p));
+    // 按 | 和 ; 都拆（管道段内可能还有多命令），逐个判断，避免段首 allow 掩盖段内危险命令
+    const bad = splitPipes(cmd).flatMap(p => splitSegments(p)).filter(p => p.trim() && !isSegSafe(p));
     if (bad.length) detail = '：' + bad.slice(0, 2).map(s => truncate(s.trim(), 50)).join('；') + (bad.length > 2 ? '…' : '');
   } else if (op === '>' || op === '<') {
     const wt = extractWriteTarget(cmd) || (() => { const m = cmd.match(/>>?\s+['"]?([^'">|;]+)['"]?/); return m ? { target: m[1].trim() } : null; })();
