@@ -362,6 +362,106 @@ function decision(level, reasonCode, reasonText) {
   process.stdout.write(json);
 }
 
+// ---- if 语句展开（受限支持）----
+// 支持形态：if (<cond>) { <body> } [elseif (<cond>) { <body> }]* [else { <body> }]
+// 语义：只有"所有分支的 cond 都无副作用 + 所有 body 都安全"才展开为 body 顺序执行，
+//       这样无论条件真假，实际执行的命令都在白名单内，可安全放行。
+// 条件白名单：$? / $var / Test-* / [ -x ... ] / 字面量；含赋值/命令替换/管道/重定向/分号 → 复杂条件，拒绝。
+// 【暂不支持，遇到一律保留原样 → COMPLEX】：
+//   - 嵌套 if（body 里再有 if/elseif/控制流）
+//   - bash 的 if <cond>; then <body>; fi 语法
+//   - 复杂条件（函数调用、命令替换、比较表达式组合等白名单之外的写法）
+// 这些形态保守地走 ask，待后续按需扩展。
+function matchBalanced(s, start, open, close) {
+  let depth = 0, quote = '';
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === quote) {
+        if (s[i + 1] === quote) { i++; continue; } // '' / "" 转义
+        quote = '';
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === open) depth++;
+    else if (ch === close) { if (--depth === 0) return i; }
+  }
+  return -1;
+}
+
+function isSafeCondition(cond) {
+  const c = cond.trim();
+  if (!c) return false;
+  // 复杂/有副作用构造：命令替换、管道、重定向、分号、大括号、赋值（PowerShell 比较用 -eq/-ne，不含 =）
+  if (/\$\(|[;|`><{}]|=[^=]/.test(c)) return false;
+  if (c === '$?') return true;                              // 上一条命令退出码
+  if (/^\$[A-Za-z_]\w*$/.test(c)) return true;              // 变量引用
+  if (/^Test-\w+\b/i.test(c)) return true;                  // PowerShell Test-* 只读判定
+  if (/^\[\s*-.*\]$/.test(c)) return true;                  // bash test [ -f x ]
+  if (/^(?:'.*'|".*"|\d+(?:\.\d+)?|true|false)$/i.test(c)) return true; // 字面量
+  return false;
+}
+
+// 从 startIdx（指向 if 之后）解析一条 if/elseif/else 链，返回 { clauses, end } 或 null。
+function parseIfChain(s, startIdx) {
+  let pos = startIdx;
+  const clauses = [];
+  const parseClause = (isElse) => {
+    let cond = null;
+    if (!isElse) {
+      while (pos < s.length && /\s/.test(s[pos])) pos++;
+      if (s[pos] !== '(') return false;
+      const end = matchBalanced(s, pos, '(', ')');
+      if (end < 0) return false;
+      cond = s.slice(pos + 1, end);
+      pos = end + 1;
+    }
+    while (pos < s.length && /\s/.test(s[pos])) pos++;
+    if (s[pos] !== '{') return false;
+    const end = matchBalanced(s, pos, '{', '}');
+    if (end < 0) return false;
+    clauses.push({ cond, body: s.slice(pos + 1, end) });
+    pos = end + 1;
+    return true;
+  };
+  if (!parseClause(false)) return null;
+  while (true) {
+    const rest = s.slice(pos);
+    let m = rest.match(/^\s*elseif\b/);
+    if (m) { pos += m[0].length; if (!parseClause(false)) return null; continue; }
+    m = rest.match(/^\s*else\b/);
+    if (m) { pos += m[0].length; if (!parseClause(true)) return null; break; }
+    break;
+  }
+  return { clauses, end: pos };
+}
+
+function expandIfBlocks(s) {
+  const re = /\bif\s*\(/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(s)) !== null) {
+    const parsed = parseIfChain(s, m.index + 2);
+    if (!parsed) continue; // 解析失败 → 保留，由 COMPLEX 检查拦
+    const bodies = [];
+    let ok = true;
+    for (const c of parsed.clauses) {
+      if (c.cond !== null && !isSafeCondition(c.cond)) { ok = false; break; }
+      // 嵌套 if / 控制流 / 脚本块 → 不支持
+      if (/\b(?:if|elseif|foreach|while|for|switch|function)\s*[\({]/.test(c.body)
+        || /[{}]/.test(stripQuoted(c.body))) { ok = false; break; }
+      bodies.push(c.body.trim());
+    }
+    if (!ok) continue;
+    const expansion = bodies.filter(Boolean).join('; ');
+    out += s.slice(last, m.index) + expansion;
+    last = parsed.end;
+    re.lastIndex = parsed.end;
+  }
+  out += s.slice(last);
+  return out;
+}
+
 // 剥离 bash 命令组边界：{ cmd1; cmd2; } 语义等价于 cmd1; cmd2，边界 { } 无独立语义。
 // 仅剥"段首的 { "和"段尾的 }"（命令组语法）；嵌在命令里的 {（如 ForEach-Object { ... }）保留，
 // 由 COMPLEX_RE 继续判定为脚本块。
@@ -376,10 +476,11 @@ function stripGroupBraces(s) {
   }).filter(Boolean).join('; ');
 }
 
-// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 脚本文件展开 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
+// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 脚本文件展开 → if块展开 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
 let cmd = unwrapShell(rawCmd);
 cmd = resolveVars(cmd);
 cmd = expandScriptFiles(cmd);
+cmd = expandIfBlocks(cmd);
 cmd = stripHarmlessRedir(cmd);
 cmd = normalizeSafePipes(cmd);
 cmd = stripGroupBraces(cmd);
