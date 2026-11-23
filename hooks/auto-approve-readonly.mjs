@@ -322,11 +322,25 @@ function decision(level, reasonCode, reasonText) {
   process.stdout.write(json);
 }
 
-// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 按 write_allow 剥离无害写重定向 → 安全管道归一化
+// 剥离 bash 命令组边界：{ cmd1; cmd2; } 语义等价于 cmd1; cmd2，边界 { } 无独立语义。
+// 仅剥"段首的 { "和"段尾的 }"（命令组语法）；嵌在命令里的 {（如 ForEach-Object { ... }）保留，
+// 由 COMPLEX_RE 继续判定为脚本块。
+function stripGroupBraces(s) {
+  return splitSegments(s).map(seg => {
+    let t = seg.trim();
+    if (/^\{\s+/.test(t)) t = t.replace(/^\{\s+/, '');  // 段首 {
+    if (/\s+\}$/.test(t)) t = t.replace(/\s+\}$/, '');  // 段尾 }
+    if (t === '{' || t === '}') t = '';                   // 纯边界段
+    return t;
+  }).filter(Boolean).join('; ');
+}
+
+// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
 let cmd = unwrapShell(rawCmd);
 cmd = resolveVars(cmd);
 cmd = stripHarmlessRedir(cmd);
 cmd = normalizeSafePipes(cmd);
+cmd = stripGroupBraces(cmd);
 
 if (userLayer.mode === 'allow-all') {
   decision('allow', REASON.ALLOW_MODE_ALL, '✅ mode=allow-all：全部放行');
@@ -511,11 +525,18 @@ function normalizeSafePipes(s) {
   }).join('; ');
 }
 
-// 1. 复杂结构优先判定 → ask。带 {} 脚本块/控制流的命令，本质是"无法可靠分析"，
+// 判断是否存在"脚本块"：{} 出现在非边界段里才算。
+// bash 命令组 { cmd1; cmd2; } 被 splitSegments 拆开后，{ 和 } 各自独立成段（纯边界，无副作用），
+// 不算脚本块；而 ForEach-Object { ... } / if (...) { ... } 的 { 嵌在命令段内，算脚本块。
+function hasScriptBlock(s) {
+  return splitSegments(s).some(seg => /[{}]/.test(stripQuoted(seg)) && !/^[{}]$/.test(seg.trim()));
+}
+
+// 1. 复杂结构优先判定 → ask。带脚本块/控制流的命令，本质是"无法可靠分析"，
 // 比管道/重定向等运算符更根本，故优先于下面的运算符检查（给出更准的 reason）。
 // 用 stripQuoted 去掉引号内内容，避免把管道传入的 JSON 字符串（含 {}）误判为脚本块。
 const cmdNoQuoted = stripQuoted(cmd);
-if (/[\r\n]/.test(cmd) || /[{}]/.test(cmdNoQuoted) || COMPLEX_RE.test(cmdNoQuoted)) {
+if (/[\r\n]/.test(cmd) || hasScriptBlock(cmd) || COMPLEX_RE.test(cmdNoQuoted)) {
   decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含循环/脚本块等复杂结构，无法自动分析，请人工审查');
   process.exit(0);
 }
