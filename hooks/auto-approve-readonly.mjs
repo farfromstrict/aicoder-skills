@@ -742,11 +742,15 @@ function hasScriptBlock(s) {
 // 用 stripQuoted 去掉引号内内容，避免把管道传入的 JSON 字符串（含 {}）误判为脚本块。
 const cmdNoQuoted = stripQuoted(cmd);
 if (LOOP_RE.test(cmdNoQuoted)) {
-  decision('ask', REASON.ASK_LOOP, '⚠️ 循环体内存在无法可靠分析的操作，请人工审查');
+  const lm = cmdNoQuoted.match(/\b(for|foreach|while)\b\s*([^;{]*)/i);
+  const detail = lm ? '：' + truncate((lm[1] + ' ' + (lm[2] || '')).trim(), 50) : '';
+  decision('ask', REASON.ASK_LOOP, '⚠️ 循环体内存在无法可靠分析的操作' + detail + '，请人工审查');
   process.exit(0);
 }
 if (/[\r\n]/.test(cmd) || hasScriptBlock(cmd) || COMPLEX_RE.test(cmdNoQuoted)) {
-  decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含脚本块/控制流等复杂结构，无法自动分析，请人工审查');
+  const cm = cmdNoQuoted.match(/\b(function|if|elseif|try|catch|switch|filter|trap|param|begin|process|end)\b/i);
+  const detail = cm ? '：' + cm[1].toLowerCase() : (/[{}]/.test(cmdNoQuoted) ? '：脚本块 {}' : '');
+  decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含脚本块/控制流等复杂结构' + detail + '，无法自动分析，请人工审查');
   process.exit(0);
 }
 
@@ -765,7 +769,22 @@ if (opMatch) {
     : op === '>' || op === '<' ? '⚠️ 命令包含写文件操作，未在白名单'
     : op === '&' ? '⚠️ 调用了外部程序，无法分析其行为'
     : '⚠️ 包含命令替换，无法静态分析';
-  decision('ask', opReason, opText);
+  // 细化提示：定位具体段/目标，便于用户判断
+  let detail = '';
+  if (op === '|') {
+    const bad = splitPipes(cmd).filter(p => p.trim() && !isSegSafe(p));
+    if (bad.length) detail = '：' + bad.slice(0, 2).map(s => truncate(s.trim(), 50)).join('；') + (bad.length > 2 ? '…' : '');
+  } else if (op === '>' || op === '<') {
+    const wt = extractWriteTarget(cmd) || (() => { const m = cmd.match(/>>?\s+['"]?([^'">|;]+)['"]?/); return m ? { target: m[1].trim() } : null; })();
+    if (wt && wt.target) detail = '：' + truncate(wt.target, 60);
+  } else if (op === '&') {
+    const m = cmd.match(/&\s+([^\s;|]+)/);
+    if (m) detail = '：' + truncate(m[1], 50);
+  } else if (op === '$(' || op === '`') {
+    const sub = cmd.match(/\$\(([^)]*)\)|`([^`]*)`/);
+    if (sub) detail = '：' + truncate(sub[1] || sub[2], 50);
+  }
+  decision('ask', opReason, opText + detail);
   process.exit(0);
 }
 
