@@ -1,0 +1,11 @@
+.idea
+.vscode
+
+*test*
+
+*.swap
+*.bak
+*.log
+
+tmp
+
