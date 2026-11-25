@@ -1,15 +1,33 @@
 #!/usr/bin/env node
 /**
- * PreToolUse hook：按 permission.json 的三级正则规则逐段决策命令执行。
+ * PreToolUse hook：按 permission.json 的正则规则对 Shell 命令与文件工具做审批决策。
  *
  * 配置：C:\Users\<user>\.codebuddy\permission.json（每次执行实时读取，改完即生效）
- *   { "permissions": { "deny": [正则...], "ask": [正则...], "allow": [正则...] } }
+ *   {
+ *     "mode": "normal",
+ *     "permissions": {
+ *       "Shell": { "deny": [], "ask": [], "allow": [] },
+ *       "File":  { "Read": {..}, "Write": {..}, "Delete": {..} },
+ *       "Write": { "deny": [], "ask": [], "allow": [] },
+ *       "Edit":  { "deny": [], "ask": [], "allow": [] }
+ *     }
+ *   }
+ *   旧格式（平铺 deny/ask/allow/write_allow/delete_allow）自动兼容：整体归入 Shell，
+ *   write_allow → File.Write.allow，delete_allow → File.Delete.allow。
  *
- * 决策模型：逐段白名单——命令按 ; && || 拆段（感知引号），每段独立分类：
- *   deny（拦截）> ask（弹框）> safe（cd/$env 前缀）> allow（白名单）> unknown（未命中）
- *   全部段为 allow/safe → 放行；否则取失败段生成 reason（只列有问题的段）。
- * 复杂结构（for/foreach/if 等控制流、{} 脚本块、多行）无法可靠分析 → 一律 ask 并明示原因。
- * 管道/重定向/反引号/命令替换/单 & → 一律 ask。
+ * 工具映射：Bash/PowerShell → Shell scope；Write → File.Write + 顶层 Write；
+ *   Edit → File.Write + 顶层 Edit；Read → File.Read（matcher 暂未启用 Read）。
+ *
+ * 优先级：用户 ! 锁定 > 项目规则 > 用户普通规则 > mode > 兜底(ask)。
+ *   同层 deny > ask > allow；! 仅用户级生效，跨层锁定（!deny/!ask/!allow）。
+ *
+ * Shell 决策模型：命令按 ; && || 拆段（感知引号），每段独立分类：
+ *   deny > ask > safe（cd/$env 前缀）> allow > unknown；全部 allow/safe → 放行。
+ * 复杂结构（控制流/{} 脚本块/多行）、管道/重定向/命令替换/单 & → ask。
+ * 文件工具：对归一后的 file_path 做 File 子层与顶层 Write/Edit 正则匹配。
+ *
+ * 决策日志：~/.codebuddy/logs/auto-approve/YYYY-MM-DD.jsonl（v2 schema，JSONL）。
+ *   --replay <json行|文件>：从日志快照还原并重跑，不读当前配置，故配置改动不影响复现。
  * reason 经 \uXXXX 编码输出（JSON 文本纯 ASCII，规避插件解码问题，中文可正常渲染）。
  *
  * 前提：CodeBuddy 设置中「Auto Run」已开启，否则插件以 bypassImmune 否决 hook 的 allow。
@@ -18,16 +36,14 @@ import { readFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 
-// 参数：argv 可为 <configPath>、--mode <mode>、--rules <json>；hook 正常调用时不传，走默认。
+// 参数：--replay <json行|文件>（重放）；可选 <configPath> 覆盖用户配置（测试用）。
+// hook 正常调用时不传任何参数，走默认用户配置。
 const ARGS = process.argv.slice(2);
-let MODE_OVERRIDE = null;
-let RULES_OVERRIDE = null;
+let REPLAY_ARG = null;
 let userConfigPath = null;
 for (let i = 0; i < ARGS.length; i++) {
-  if (ARGS[i] === '--mode' && i + 1 < ARGS.length) {
-    MODE_OVERRIDE = ARGS[++i];
-  } else if (ARGS[i] === '--rules' && i + 1 < ARGS.length) {
-    RULES_OVERRIDE = ARGS[++i];
+  if (ARGS[i] === '--replay' && i + 1 < ARGS.length) {
+    REPLAY_ARG = ARGS[++i];
   } else if (!ARGS[i].startsWith('--') && !userConfigPath) {
     userConfigPath = ARGS[i];
   }
@@ -38,8 +54,8 @@ const LOG_FILE = join(homedir(), '.codebuddy', 'hooks', 'hook-probe.log');
 const now = new Date();
 const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 const DECISION_LOG = process.env.AUTO_APPROVE_LOG_OVERRIDE || join(homedir(), '.codebuddy', 'logs', 'auto-approve', `${day}.jsonl`);
-// 重放调用（传了任一覆盖参数）不落盘，避免污染生产日志
-const REPLAY = MODE_OVERRIDE !== null || RULES_OVERRIDE !== null || userConfigPath !== null;
+// 重放调用不落盘，避免污染生产日志
+const REPLAY = REPLAY_ARG !== null;
 
 // 配置缺失/非法时的兜底白名单
 const FALLBACK_ALLOW = [
@@ -50,39 +66,104 @@ const FALLBACK_ALLOW = [
   '^openspec-cn\\b',
 ];
 
-function loadRules(file, fallback) {
+const KINDS = ['deny', 'ask', 'allow'];
+function blankKinds() { return { deny: [], ask: [], allow: [] }; }
+function blankPermissions() {
+  return {
+    Shell: blankKinds(),
+    File: { Read: blankKinds(), Write: blankKinds(), Delete: blankKinds() },
+    Write: blankKinds(),
+    Edit: blankKinds(),
+  };
+}
+function strArray(a) { return Array.isArray(a) ? a.filter(x => typeof x === 'string') : []; }
+
+// 把任意 permissions 对象规整成完整的新格式结构（缺的 scope/kind 补空数组）
+function normalizePermissions(raw) {
+  const out = blankPermissions();
+  if (!raw || typeof raw !== 'object') return out;
+  for (const scope of ['Shell', 'Write', 'Edit']) {
+    const src = raw[scope];
+    if (src && typeof src === 'object') {
+      for (const k of KINDS) if (Array.isArray(src[k])) out[scope][k] = strArray(src[k]);
+    }
+  }
+  const f = raw.File;
+  if (f && typeof f === 'object') {
+    for (const sub of ['Read', 'Write', 'Delete']) {
+      const src = f[sub];
+      if (src && typeof src === 'object') {
+        for (const k of KINDS) if (Array.isArray(src[k])) out.File[sub][k] = strArray(src[k]);
+      }
+    }
+  }
+  return out;
+}
+
+// loader 双读：旧格式（平铺数组）→ Shell + File.Write/Delete；新格式按 tool scope 原样读。
+// isUser 决定 ! 是否生效（项目级忽略 !）。
+function loadLayer(file, isUser) {
   try {
     if (!existsSync(file)) return null;
     const parsed = JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
     const p = parsed?.permissions ?? {};
-    let mode = ["allow-all", "no-ask", "normal"].indexOf(parsed && parsed.mode) >= 0 ? parsed.mode : "normal";
-    // --mode 覆盖 mode（重放历史决策用）；非法值忽略
-    if (MODE_OVERRIDE && ["allow-all", "no-ask", "normal"].includes(MODE_OVERRIDE)) mode = MODE_OVERRIDE;
-    const layer = {
-      mode,
-      deny: Array.isArray(p.deny) ? p.deny : [],
-      ask: Array.isArray(p.ask) ? p.ask : [],
-      allow: Array.isArray(p.allow) ? p.allow : (fallback || FALLBACK_ALLOW),
-      write_allow: Array.isArray(p.write_allow) ? p.write_allow : [],
-      delete_allow: Array.isArray(p.delete_allow) ? p.delete_allow : [],
-    };
-    // --rules 在下面独立构造用户层，不经过这里
-    return layer;
+    const mode = ["allow-all", "no-ask", "normal"].includes(parsed && parsed.mode) ? parsed.mode : "normal";
+    const isOld = KINDS.some(k => Array.isArray(p[k])) || Array.isArray(p.write_allow) || Array.isArray(p.delete_allow);
+    let permissions;
+    if (isOld) {
+      permissions = blankPermissions();
+      for (const k of KINDS) if (Array.isArray(p[k])) permissions.Shell[k] = strArray(p[k]);
+      if (Array.isArray(p.write_allow)) permissions.File.Write.allow = strArray(p.write_allow);
+      if (Array.isArray(p.delete_allow)) permissions.File.Delete.allow = strArray(p.delete_allow);
+      if (!permissions.Shell.allow.length) permissions.Shell.allow = [...FALLBACK_ALLOW];
+    } else {
+      permissions = normalizePermissions(p);
+    }
+    return { mode, permissions, isUser };
   } catch {
     return null;
   }
 }
 
-function compile(rules) {
-  return rules
+// 用户配置缺失时的兜底层
+function blankUserLayer() {
+  const permissions = blankPermissions();
+  permissions.Shell.allow = [...FALLBACK_ALLOW];
+  return { mode: 'normal', permissions, isUser: true };
+}
+
+// 编译：剥掉开头的 ! 并记录 locked（仅用户级）；正则统一大小写不敏感。
+function compile(rules, isUser = false) {
+  return strArray(rules)
     .map(r => {
-      try { return { rule: r, re: new RegExp(r, 'i') }; } catch { return null; }
+      const locked = isUser && r.startsWith('!');
+      const src = r.startsWith('!') ? r.slice(1) : r;
+      try { return { rule: r, re: new RegExp(src, 'i'), locked }; } catch { return null; }
     })
     .filter(Boolean);
 }
-
 function firstMatch(rules, text) {
-  return rules.find(r => r.re.test(text)) || null;
+  return (rules || []).find(r => r.re.test(text)) || null;
+}
+function compileKinds(k, isUser) {
+  return { deny: compile(k.deny, isUser), ask: compile(k.ask, isUser), allow: compile(k.allow, isUser) };
+}
+function compileLayer(layer) {
+  if (!layer) return null;
+  const p = layer.permissions;
+  const u = layer.isUser;
+  return {
+    mode: layer.mode,
+    isUser: u,
+    Shell: compileKinds(p.Shell, u),
+    File: {
+      Read: compileKinds(p.File.Read, u),
+      Write: compileKinds(p.File.Write, u),
+      Delete: compileKinds(p.File.Delete, u),
+    },
+    Write: compileKinds(p.Write, u),
+    Edit: compileKinds(p.Edit, u),
+  };
 }
 
 // 解封装单段：循环剥前导 & 和 <exe> -c <script>（两种可叠加）
@@ -264,56 +345,86 @@ try {
   process.exit(0);
 }
 
-const command = input?.tool_input?.command ?? input?.command ?? '';
-const rawCmd = typeof command === 'string' ? command.trim() : '';
-
-// --rules 重放：直接用日志里的命中项构造用户层，完全不依赖 permission.json
-let userLayer;
-if (RULES_OVERRIDE) {
-  try {
-    const r = JSON.parse(RULES_OVERRIDE);
-    const norm = k => Array.isArray(r[k]) ? r[k].filter(x => typeof x === 'string') : [];
-    userLayer = {
-      mode: ["allow-all", "no-ask", "normal"].includes(MODE_OVERRIDE) ? MODE_OVERRIDE : 'normal',
-      deny: norm('deny'), ask: norm('ask'), allow: norm('allow'),
-      write_allow: norm('write_allow'), delete_allow: norm('delete_allow'),
-    };
-  } catch {
-    userLayer = { mode: 'normal', deny: [], ask: [], allow: FALLBACK_ALLOW, write_allow: [], delete_allow: [] };
+// ---- 重放：从日志快照还原 tool_name / tool_input / script / mode / hit_rules ----
+function replayFail(msg) {
+  process.stderr.write('[auto-approve] replay failed: ' + msg + '\n');
+  process.exit(2);
+}
+let replayLog = null;
+if (REPLAY) {
+  let text = REPLAY_ARG;
+  if (!text.trim().startsWith('{')) {
+    // 传的是文件路径 → 取最后一行非空记录
+    try {
+      if (!existsSync(text)) throw new Error('文件不存在');
+      const lines = readFileSync(text, 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
+      text = lines[lines.length - 1] || '';
+    } catch (e) { replayFail('无法读取重放日志：' + e.message); }
   }
+  try { replayLog = JSON.parse(text); } catch { replayFail('重放日志不是合法 JSON'); }
+  if (!replayLog || replayLog.v !== 2) replayFail('仅支持 v:2 日志；旧格式日志（无 v 字段）无法 --replay');
+}
+
+const toolName = REPLAY ? (replayLog.tool_name || 'Bash') : (input?.tool_name || 'Bash');
+const isShellTool = /^(Bash|PowerShell)$/.test(toolName);
+const isFileTool = /^(Write|Edit|Read)$/.test(toolName);
+
+const command = REPLAY
+  ? (replayLog.tool_input?.command ?? '')
+  : (input?.tool_input?.command ?? input?.command ?? '');
+const rawCmd = typeof command === 'string' ? command.trim() : '';
+const filePath = (REPLAY ? replayLog.tool_input?.file_path : input?.tool_input?.file_path) ?? '';
+
+// user / project layer：重放时完全来自日志快照，不读当前 permission.json
+let userLayer, projLayer;
+if (REPLAY) {
+  const hits = replayLog.hit_rules || {};
+  const modes = replayLog.mode || {};
+  userLayer = { mode: modes.user ?? 'normal', permissions: normalizePermissions(hits.user ?? {}), isUser: true };
+  projLayer = { mode: modes.project ?? 'normal', permissions: normalizePermissions(hits.project ?? {}), isUser: false };
 } else {
-  userLayer = loadRules(USER_CONFIG, FALLBACK_ALLOW) || { mode: 'normal', deny: [], ask: [], allow: FALLBACK_ALLOW, write_allow: [], delete_allow: [] };
+  userLayer = loadLayer(USER_CONFIG, true) || blankUserLayer();
+  const pDir = process.env.CODEBUDDY_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || '';
+  projLayer = pDir ? loadLayer(join(pDir, '.codebuddy', 'permission.json'), false) : null;
 }
-const pDir = process.env.CODEBUDDY_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || '';
-const projLayer = pDir ? loadRules(join(pDir, '.codebuddy', 'permission.json')) : null;
-const denyRules = compile(userLayer.deny);
-const askRules = compile(userLayer.ask);
-const allowRules = compile(userLayer.allow);
-const writeRules = compile(userLayer.write_allow);
-const deleteRules = compile(userLayer.delete_allow);
-const projDeny = projLayer ? compile(projLayer.deny) : [];
-const projAsk = projLayer ? compile(projLayer.ask) : [];
-const projAllow = projLayer ? compile(projLayer.allow) : [];
-const projWrite = projLayer ? compile(projLayer.write_allow) : [];
-const projDelete = projLayer ? compile(projLayer.delete_allow) : [];
+const userC = compileLayer(userLayer);
+const projC = compileLayer(projLayer);
+const denyRules = userC.Shell.deny;
+const askRules = userC.Shell.ask;
+const allowRules = userC.Shell.allow;
+const writeRules = userC.File.Write.allow;   // 旧 write_allow → File.Write.allow
+const deleteRules = userC.File.Delete.allow; // 旧 delete_allow → File.Delete.allow
+const projDeny = projC ? projC.Shell.deny : [];
+const projAsk = projC ? projC.Shell.ask : [];
+const projAllow = projC ? projC.Shell.allow : [];
+const projWrite = projC ? projC.File.Write.allow : [];
+const projDelete = projC ? projC.File.Delete.allow : [];
 
-
-
-
-// 命中的规则（去重，按文本），供决策日志与 --rules 重放使用
-const hit = { deny: new Set(), ask: new Set(), allow: new Set(), write_allow: new Set(), delete_allow: new Set() };
+// 命中的规则（按 layer / scope / kind 收集，v2 日志 hit_rules 用嵌套结构编码 layer/scope/!）
+const hitRulesData = { user: {}, project: {} };
+function trackHitEx(layer, scopeArr, kind, rule) {
+  if (!rule || !hitRulesData[layer]) return;
+  let node = hitRulesData[layer];
+  for (const key of scopeArr) { node[key] = node[key] || {}; node = node[key]; }
+  node[kind] = node[kind] || [];
+  if (!node[kind].includes(rule)) node[kind].push(rule);
+}
+// 判断一条规则属于用户层还是项目层；同名文本出现在两层时归用户（文本相同则重跑等价）
+function ruleLayer(rule) {
+  const u = [
+    ...userC.Shell.deny, ...userC.Shell.ask, ...userC.Shell.allow,
+    ...userC.File.Write.allow, ...userC.File.Delete.allow,
+  ];
+  return u.some(r => r.rule === rule) ? 'user' : 'project';
+}
+// 兼容既有调用点：deny/ask/allow → Shell；write_allow → File.Write.allow；delete_allow → File.Delete.allow
 function trackHit(kind, rule) {
-  if (rule && hit[kind]) hit[kind].add(rule);
+  if (!rule) return;
+  if (kind === 'write_allow') trackHitEx(ruleLayer(rule), ['File', 'Write'], 'allow', rule);
+  else if (kind === 'delete_allow') trackHitEx(ruleLayer(rule), ['File', 'Delete'], 'allow', rule);
+  else trackHitEx(ruleLayer(rule), ['Shell'], kind, rule);
 }
-function hitRules() {
-  return {
-    deny: [...hit.deny],
-    ask: [...hit.ask],
-    allow: [...hit.allow],
-    write_allow: [...hit.write_allow],
-    delete_allow: [...hit.delete_allow],
-  };
-}
+function hitRules() { return hitRulesData; }
 
 // reason 枚举：deny=路径, ask=内部判定类型, allow=放行路径
 const REASON = {
@@ -335,27 +446,43 @@ const REASON = {
   ALLOW_MODE_PROJECT: 'ALLOW_MODE_PROJECT',
   ALLOW_MODE_NOASK: 'ALLOW_MODE_NOASK',
   ALLOW_WHITELIST: 'ALLOW_WHITELIST',
+  ALLOW_FILE_RULE: 'ALLOW_FILE_RULE',
+  DENY_FILE_RULE: 'DENY_FILE_RULE',
+  DENY_FILE_LOCKED: 'DENY_FILE_LOCKED',
+  ASK_FILE_RULE: 'ASK_FILE_RULE',
+  DENY_SHELL_LOCKED: 'DENY_SHELL_LOCKED',
 };
 
 function decision(level, reasonCode, reasonText) {
-  // 决策日志（按日期分文件）：raw / decision / reason(enum) / mode / hit_rules，重放不落盘
+  const fullReason = reasonText;
+  // CodeBuddy 对 hook reason 有 500 字符上限，超过会被 summarizeHookReason 截断。
+  // 控制在 480 以内，把字符预算尽量留给命令本身。
+  if (reasonText && reasonText.length > 480) reasonText = reasonText.slice(0, 480) + '…';
+  // 决策日志 v2（JSONL）：重放不落盘。tool_input 只投影 command / file_path，不存内容字段。
   if (!REPLAY) {
     try {
       mkdirSync(dirname(DECISION_LOG), { recursive: true });
-      appendFileSync(DECISION_LOG, JSON.stringify({
-        raw: rawCmd.slice(0, 4000),
+      const log = {
+        v: 2,
+        ts: new Date().toISOString(),
+        tool_name: toolName,
+        tool_input: isFileTool ? { file_path: filePath } : { command: rawCmd },
         decision: level,
         reason: reasonCode,
-        mode: userLayer.mode,
+        reason_text: fullReason,
+        mode: { user: userLayer.mode, project: projLayer ? projLayer.mode : 'normal' },
         hit_rules: hitRules(),
-      }) + '\n');
+      };
+      // script 仅当预处理改变了命令时写（脚本展开/变量解析/解包等），文件类工具省略。
+      if (isShellTool && cmd !== rawCmd) log.script = cmd;
+      appendFileSync(DECISION_LOG, JSON.stringify(log) + '\n');
     } catch { /* fail-open：写日志失败不影响决策 */ }
   }
   // 人读文本日志（保留原有行为）
   try {
     const rawNote = rawCmd !== cmd ? ` | raw=${rawCmd.slice(0, 200)}` : '';
     appendFileSync(LOG_FILE,
-      `${new Date().toISOString()} | decision=${level} | cwd=${process.cwd()} | cmd=${cmd.slice(0, 200)}${rawNote}\n`);
+      `${new Date().toISOString()} | decision=${level} | tool=${toolName} | cwd=${process.cwd()} | cmd=${String(cmd).slice(0, 200)}${rawNote}\n`);
   } catch {}
   // 强制非 ASCII 字符以 \uXXXX 转义（JSON 文本纯 ASCII，中文渲染正常）
   const json = JSON.stringify({
@@ -562,43 +689,154 @@ function stripGroupBraces(s) {
   }).filter(Boolean).join('; ');
 }
 
-// 预处理链（规则与 hit 已就绪）：解封装 → 变量解析 → 脚本文件展开 → if块展开 → for循环展开 → 按 write_allow 剥离无害写重定向 → 安全管道归一化 → 剥命令组边界
-let cmd = unwrapShell(rawCmd);
-cmd = resolveVars(cmd);
-cmd = expandScriptFiles(cmd);
-cmd = expandIfBlocks(cmd);
-cmd = expandForLoops(cmd);
-cmd = expandPowerShellForeach(cmd);
-cmd = stripHarmlessRedir(cmd);
-cmd = normalizeSafePipes(cmd);
-cmd = stripGroupBraces(cmd);
+// 预处理链：重放时跳过（cmd 直接取日志 script），否则正常生成。
+// 解封装 → 变量解析 → 脚本文件展开 → if 块 → for 循环 → 无害重定向剥离 → 安全管道归一化 → 剥命令组边界。
+let cmd;
+if (REPLAY) {
+  cmd = String(replayLog.script ?? rawCmd).trim();
+} else if (isFileTool) {
+  cmd = filePath; // 文件工具不走命令预处理，cmd 仅用于人读日志占位
+} else {
+  cmd = unwrapShell(rawCmd);
+  cmd = resolveVars(cmd);
+  cmd = expandScriptFiles(cmd);
+  cmd = expandIfBlocks(cmd);
+  cmd = expandForLoops(cmd);
+  cmd = expandPowerShellForeach(cmd);
+  cmd = stripHarmlessRedir(cmd);
+  cmd = normalizeSafePipes(cmd);
+  cmd = stripGroupBraces(cmd);
+}
 
-if (userLayer.mode === 'allow-all') {
-  decision('allow', REASON.ALLOW_MODE_ALL, '✅ mode=allow-all：全部放行');
+// ---- 文件类工具分支（Write / Edit / Read）----
+if (isFileTool) {
+  const norm = p => String(p || '').replace(/\\/g, '/').toLowerCase();
+  const target = norm(filePath);
+
+  // 一个 layer 内跨 scope 取最优：deny > ask > allow（同层 ! 不改变此顺序）。
+  function bestOfLayer(layerScopes, treatAskAsAllow) {
+    let best = null;
+    for (const s of layerScopes) {
+      if (best && best.kind === 'deny') break;
+      const d = firstMatch(s.kinds.deny, target);
+      if (d) { best = { decision: 'deny', kind: 'deny', rule: d.rule, locked: d.locked, scope: s.scope, layer: s.layer }; break; }
+      const a = firstMatch(s.kinds.ask, target);
+      if (a && (!best || best.kind === 'allow'))
+        best = { decision: treatAskAsAllow && !a.locked ? 'allow' : 'ask', kind: 'ask', rule: a.rule, locked: a.locked, scope: s.scope, layer: s.layer };
+      const w = firstMatch(s.kinds.allow, target);
+      if (w && !best)
+        best = { decision: 'allow', kind: 'allow', rule: w.rule, locked: w.locked, scope: s.scope, layer: s.layer };
+    }
+    return best;
+  }
+  function finalizeFile(r) {
+    const reason = r.decision === 'deny' ? (r.locked ? REASON.DENY_FILE_LOCKED : REASON.DENY_FILE_RULE)
+      : r.decision === 'ask' ? REASON.ASK_FILE_RULE : REASON.ALLOW_FILE_RULE;
+    return { level: r.decision, reason, rule: r.rule, kind: r.kind, layer: r.layer, scope: r.scope,
+      text: (r.decision === 'deny' ? '⛔ 文件deny' : r.decision === 'ask' ? '⚠️ 文件ask' : '✅ 文件allow') + '：' + truncate(target, 120) };
+  }
+  function modeDecisionFile(layer, mode) {
+    return { level: 'allow', reason: layer === 'project' ? REASON.ALLOW_MODE_PROJECT
+      : (mode === 'allow-all' ? REASON.ALLOW_MODE_ALL : REASON.ALLOW_MODE_NOASK),
+      rule: null, kind: null, layer, scope: null, text: '✅ ' + mode };
+  }
+
+  const scopes = [];
+  if (toolName === 'Read') {
+    scopes.push({ layer: 'user', kinds: userC.File.Read, scope: ['File', 'Read'] });
+    if (projC) scopes.push({ layer: 'project', kinds: projC.File.Read, scope: ['File', 'Read'] });
+  } else {
+    scopes.push({ layer: 'user', kinds: userC.File.Write, scope: ['File', 'Write'] });
+    if (projC) scopes.push({ layer: 'project', kinds: projC.File.Write, scope: ['File', 'Write'] });
+    const top = toolName === 'Write' ? 'Write' : 'Edit';
+    scopes.push({ layer: 'user', kinds: userC[top], scope: [top] });
+    if (projC) scopes.push({ layer: 'project', kinds: projC[top], scope: [top] });
+  }
+  const byUser = scopes.filter(s => s.layer === 'user');
+  const byProj = scopes.filter(s => s.layer === 'project');
+  const projMode = projLayer ? projLayer.mode : 'normal';
+
+  // 优先级：用户 ! 锁 → 项目规则 → 项目 mode → 用户普通规则 → 用户 mode → 兜底 ask
+  const userBest = bestOfLayer(byUser, userLayer.mode === 'no-ask');
+  let res = null;
+  if (userBest && userBest.locked) res = finalizeFile(userBest);
+  if (!res && byProj.length) {
+    const pb = bestOfLayer(byProj, projMode === 'no-ask');
+    if (pb) res = finalizeFile(pb);
+    else if (projMode === 'allow-all' || projMode === 'no-ask') res = modeDecisionFile('project', projMode);
+  }
+  if (!res && userBest) res = finalizeFile(userBest);
+  if (!res && (userLayer.mode === 'allow-all' || userLayer.mode === 'no-ask'))
+    res = modeDecisionFile('user', userLayer.mode);
+  if (res && res.rule) trackHitEx(res.layer, res.scope, res.kind, res.rule);
+  decision(res ? res.level : 'ask', res ? res.reason : REASON.ASK_UNKNOWN,
+    res ? res.text : '⚠️ 文件待确认：' + truncate(target, 120));
   process.exit(0);
 }
-const segDenyHit = splitSegments(cmd).map(s => ({ seg: s, m: firstMatch(denyRules, s) })).find(x => x.m) || null;
-const wholeDeny = firstMatch(denyRules, cmd);
-if (wholeDeny || segDenyHit) {
-  trackHit('deny', (wholeDeny || segDenyHit.m).rule);
-  decision('deny', wholeDeny ? REASON.DENY_USER_WHOLE : REASON.DENY_USER_SEG,
-    '⛔ 用户级 deny 兜底：' + truncate(segDenyHit ? segDenyHit.seg : cmd, 60));
-  process.exit(0);
-}
-if (projLayer && projLayer.mode === 'allow-all') {
-  decision('allow', REASON.ALLOW_MODE_PROJECT, '✅ 项目级 mode=allow-all（未命中用户 deny）');
-  process.exit(0);
-}
-const projSegDenyHit = projLayer ? splitSegments(cmd).map(s => ({ seg: s, m: firstMatch(projDeny, s) })).find(x => x.m) : null;
-const projWholeDeny = projLayer ? firstMatch(projDeny, cmd) : null;
-if (projLayer && (projWholeDeny || projSegDenyHit) && (userLayer.mode === 'no-ask' || projLayer.mode === 'no-ask')) {
-  trackHit('deny', (projWholeDeny || projSegDenyHit.m).rule);
-  decision('deny', REASON.DENY_PROJECT, '⛔ 项目级 deny：' + truncate(projSegDenyHit ? projSegDenyHit.seg : cmd, 60));
-  process.exit(0);
-}
-if (userLayer.mode === 'no-ask' || (projLayer && projLayer.mode === 'no-ask')) {
-  decision('allow', REASON.ALLOW_MODE_NOASK, '✅ mode=no-ask：未命中 deny 规则，放行');
-  process.exit(0);
+
+// ---- Shell 早期优先级链（v2，重写 :576-602）----
+{
+  // 命中辅助：整串优先（正则多锚定 ^），其次逐段（; && || 已由 splitSegments 拆开）。
+  function hitAnywhere(rules, text, withSeg = true) {
+    const whole = firstMatch(rules, text);
+    if (whole) return { m: whole, whole: true };
+    if (withSeg) for (const s of splitSegments(text)) {
+      const m = firstMatch(rules, s);
+      if (m) return { m, whole: false, seg: s };
+    }
+    return null;
+  }
+
+  // 1. 用户 ! 规则：跨层锁定，最高优先
+  const lockedDeny = hitAnywhere(userC.Shell.deny.filter(r => r.locked), cmd);
+  if (lockedDeny) {
+    trackHitEx('user', ['Shell'], 'deny', lockedDeny.m.rule);
+    decision('deny', REASON.DENY_SHELL_LOCKED, '⛔ 用户!deny：' + truncate(lockedDeny.whole ? cmd : lockedDeny.seg, 120));
+    process.exit(0);
+  }
+  const lockedAsk = hitAnywhere(userC.Shell.ask.filter(r => r.locked), cmd);
+  if (lockedAsk) {
+    trackHitEx('user', ['Shell'], 'ask', lockedAsk.m.rule);
+    decision('ask', REASON.ASK_RULE, '⚠️ 用户!ask：' + truncate(lockedAsk.whole ? cmd : lockedAsk.seg, 120));
+    process.exit(0);
+  }
+  // !allow：不直接放行（避免绕过复杂/运算符检查），仅标记"项目 deny 不可收紧"
+  const ignoreProjDeny = !!hitAnywhere(userC.Shell.allow.filter(r => r.locked), cmd, false);
+
+  // 2. 项目层：项目 deny（除被 !allow 锁定）；项目 mode=allow-all
+  if (!ignoreProjDeny) {
+    const pd = hitAnywhere(projDeny, cmd);
+    if (pd) {
+      trackHitEx('project', ['Shell'], 'deny', pd.m.rule);
+      decision('deny', REASON.DENY_PROJECT, '⛔ 项目deny：' + truncate(pd.whole ? cmd : pd.seg, 120));
+      process.exit(0);
+    }
+  }
+  if (projC && projC.mode === 'allow-all') {
+    decision('allow', REASON.ALLOW_MODE_PROJECT, '✅ 项目allow-all');
+    process.exit(0);
+  }
+
+  // 3. 用户普通 deny（项目规则优先 → 实现"项目 > 用户"；!deny 已在步骤 1 处理）
+  // 项目 allow/ask 命中时让后续逐段流水线处理（它会先判项目规则），不在此提前 deny。
+  const projOverrides = !!hitAnywhere(projAllow, cmd, false) || !!hitAnywhere(projAsk, cmd, false);
+  const ud = hitAnywhere(userC.Shell.deny.filter(r => !r.locked), cmd);
+  if (ud && !projOverrides) {
+    trackHitEx('user', ['Shell'], 'deny', ud.m.rule);
+    decision('deny', ud.whole ? REASON.DENY_USER_WHOLE : REASON.DENY_USER_SEG,
+      '⛔ 用户deny：' + truncate(ud.whole ? cmd : ud.seg, 120));
+    process.exit(0);
+  }
+
+  // 4. mode：放到规则之后，故普通 deny 能压过 allow-all；!deny/!ask 已在步骤 1 处理
+  if (userLayer.mode === 'allow-all') {
+    decision('allow', REASON.ALLOW_MODE_ALL, '✅ allow-all');
+    process.exit(0);
+  }
+  if (userLayer.mode === 'no-ask' || (projC && projC.mode === 'no-ask')) {
+    decision('allow', REASON.ALLOW_MODE_NOASK, '✅ no-ask');
+    process.exit(0);
+  }
 }
 // 提取段中的写入目标路径：> / >> / Out-File -FilePath。返回 { target, rest } 或 null。
 function extractWriteTarget(seg) {
@@ -795,14 +1033,14 @@ function hasScriptBlock(s) {
 const cmdNoQuoted = stripQuoted(cmd);
 if (LOOP_RE.test(cmdNoQuoted)) {
   const lm = cmdNoQuoted.match(/\b(for|foreach|while)\b\s*([^;{]*)/i);
-  const detail = lm ? '：' + truncate((lm[1] + ' ' + (lm[2] || '')).trim(), 50) : '';
-  decision('ask', REASON.ASK_LOOP, '⚠️ 循环体内存在无法可靠分析的操作' + detail + '，请人工审查');
+  const detail = lm ? '：' + truncate((lm[1] + ' ' + (lm[2] || '')).trim(), 120) : '';
+  decision('ask', REASON.ASK_LOOP, '⚠️ 循环体' + detail);
   process.exit(0);
 }
 if (/[\r\n]/.test(cmd) || hasScriptBlock(cmd) || COMPLEX_RE.test(cmdNoQuoted)) {
   const cm = cmdNoQuoted.match(/\b(function|if|elseif|try|catch|switch|filter|trap|param|begin|process|end)\b/i);
   const detail = cm ? '：' + cm[1].toLowerCase() : (/[{}]/.test(cmdNoQuoted) ? '：脚本块 {}' : '');
-  decision('ask', REASON.ASK_COMPLEX, '⚠️ 包含脚本块/控制流等复杂结构' + detail + '，无法自动分析，请人工审查');
+  decision('ask', REASON.ASK_COMPLEX, '⚠️ 复杂结构' + detail);
   process.exit(0);
 }
 
@@ -817,25 +1055,25 @@ if (opMatch) {
     : op === '>' || op === '<' ? REASON.ASK_FILE_WRITE
     : op === '&' ? REASON.ASK_EXTERNAL_CALL
     : REASON.ASK_OPERATOR_SUBST; // ` 或 $(
-  const opText = op === '|' ? '⚠️ 管道中的命令存在不在白名单的操作'
-    : op === '>' || op === '<' ? '⚠️ 命令包含写文件操作，未在白名单'
-    : op === '&' ? '⚠️ 调用了外部程序，无法分析其行为'
-    : '⚠️ 包含命令替换，无法静态分析';
+  const opText = op === '|' ? '⚠️ 管道未白名单'
+    : op === '>' || op === '<' ? '⚠️ 写文件未白名单'
+    : op === '&' ? '⚠️ 外部程序'
+    : '⚠️ 命令替换';
   // 细化提示：定位具体段/目标，便于用户判断
   let detail = '';
   if (op === '|') {
     // 按 | 和 ; 都拆（管道段内可能还有多命令），逐个判断，避免段首 allow 掩盖段内危险命令
     const bad = splitPipes(cmd).flatMap(p => splitSegments(p)).filter(p => p.trim() && !isSegSafe(p));
-    if (bad.length) detail = '：' + bad.slice(0, 2).map(s => truncate(s.trim(), 50)).join('；') + (bad.length > 2 ? '…' : '');
+    if (bad.length) detail = (bad.length > 3 ? `[共${bad.length}段]：` : '：') + bad.slice(0, 3).map(s => truncate(s.trim(), 120)).join('；');
   } else if (op === '>' || op === '<') {
     const wt = extractWriteTarget(cmd) || (() => { const m = cmd.match(/>>?\s+['"]?([^'">|;]+)['"]?/); return m ? { target: m[1].trim() } : null; })();
-    if (wt && wt.target) detail = '：' + truncate(wt.target, 60);
+    if (wt && wt.target) detail = '：' + truncate(wt.target, 120);
   } else if (op === '&') {
     const m = cmd.match(/&\s+([^\s;|]+)/);
-    if (m) detail = '：' + truncate(m[1], 50);
+    if (m) detail = '：' + truncate(m[1], 120);
   } else if (op === '$(' || op === '`') {
     const sub = cmd.match(/\$\(([^)]*)\)|`([^`]*)`/);
-    if (sub) detail = '：' + truncate(sub[1] || sub[2], 50);
+    if (sub) detail = '：' + truncate(sub[1] || sub[2], 120);
   }
   decision('ask', opReason, opText + detail);
   process.exit(0);
@@ -897,39 +1135,31 @@ for (const r of results) {
   if (r.wmRule) trackHit('write_allow', r.wmRule);
 }
 
-// 4. 任一段命中 deny → 拦截并指出所在段
-if (userLayer.mode !== 'allow-all') {
-  const veto = results.find(r => r.kind === 'allow' && firstMatch(denyRules, r.seg));
-  if (veto) {
-    veto.kind = 'deny'; veto.layer = '[用户级兜底]';
-    veto.rule = firstMatch(denyRules, veto.seg).rule;
-    trackHit('deny', veto.rule);
-  }
-}
+// 4. 任一段命中 deny → 拦截并指出所在段。
+// v2 移除旧的"用户兜底 veto"：项目规则优先于用户普通 deny，用户敏感规则应显式用 !deny 锁定
+// （已在早期优先级链步骤 1 处理），不再把项目放行的段反向改回 deny。
 const denyHit = results.find(r => r.kind === 'deny');
 if (denyHit) {
-  const dReason = denyHit.layer === '[用户级兜底]' ? REASON.DENY_VETO
-    : denyHit.layer === '[项目级]' ? REASON.DENY_PROJECT
-    : REASON.DENY_SEG;
-  decision('deny', dReason, `⛔ 第 ${denyHit.i + 1} 段命中 deny 规则：${truncate(denyHit.seg, 60)}`);
+  const dReason = denyHit.layer === '[项目级]' ? REASON.DENY_PROJECT : REASON.DENY_SEG;
+  decision('deny', dReason, `⛔ 第${denyHit.i + 1}段deny：${truncate(denyHit.seg, 120)}`);
   process.exit(0);
 }
 
 // 5. 全部段 allow/safe → 放行
 if (results.every(r => r.kind === 'allow' || r.kind === 'safe')) {
-  decision('allow', REASON.ALLOW_WHITELIST, segs.length > 1 ? `✅ 共 ${segs.length} 段，均在白名单内` : '✅ 白名单命令');
+  decision('allow', REASON.ALLOW_WHITELIST, segs.length > 1 ? `✅ 白名单(${segs.length}段)` : '✅ 白名单');
   process.exit(0);
 }
 
 // 6. 提取失败段（只列有问题的段）
 const bad = results.filter(r => r.kind !== 'allow' && r.kind !== 'safe');
 const badDesc = bad.slice(0, 3).map(r => {
-  const label = r.kind === 'del_block' ? '删除目标不在白名单'
-    : (r.layer ? r.layer + ' ' : '') + (r.kind === 'ask' ? '命中 ask 规则' : '不在白名单');
-  return `第 ${r.i + 1} 段 [${truncate(r.seg, 50)}] ${label}`;
+  const label = r.kind === 'del_block' ? '删除未白名单'
+    : (r.layer ? r.layer.replace(/[\[\]]/g, '') + '·' : '') + (r.kind === 'ask' ? 'ask规则' : '未白名单');
+  return `${label}·第${r.i + 1}段：${truncate(r.seg, 120)}`;
 });
-const more = bad.length > 3 ? `（另有 ${bad.length - 3} 段）` : '';
+const more = bad.length > 3 ? `(${bad.length}段)` : '';
 const aReason = bad[0].kind === 'ask' ? REASON.ASK_RULE
   : bad[0].kind === 'del_block' ? REASON.ASK_FILE_DELETE
   : REASON.ASK_UNKNOWN;
-decision('ask', aReason, `⚠️ 需要确认：${badDesc.join('；')}${more}`);
+decision('ask', aReason, `⚠️ 待确认${more}：${badDesc.join('；')}`);
