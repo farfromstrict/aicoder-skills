@@ -2266,7 +2266,7 @@ function appendLogGroup(logPath, date, entries) {
   writeText(logPath, lines.join('\n').replace(/\n+$/, '') + '\n');
 }
 
-function cmdStageCommit(values) {
+function cmdStageCommitInner(values) {
   if (!values.manifest) { console.error('usage: stage-commit --manifest <path> [--apply] [--root <dir>]'); return 1; }
   let m;
   try { m = readManifest(values.manifest); } catch (e) { console.error(`ERROR: ${e.message}`); return 1; }
@@ -2335,8 +2335,17 @@ function cmdStageCommit(values) {
   return 0;
 }
 
-// ---------------------------------------------------------------- quick
-// One-shot speed note: take --content + --slug, build a Source + Idea pair,
+// Wrapper that emits begin/end even when stage-commit is called directly
+// (e.g. from sketch) rather than through dispatch's timed().
+function cmdStageCommit(values) {
+  emitTiming('stage-commit:begin');
+  const t0 = Date.now();
+  try { return cmdStageCommitInner(values); }
+  finally { emitTiming('stage-commit:end', { ms: Date.now() - t0 }); }
+}
+
+// ---------------------------------------------------------------- sketch
+// One-shot speed note: take --content + --slug, build a Source + Sketch pair,
 // stage it, and commit via stage-commit. No LLM reasoning in this command.
 // The LLM's only job (outside this script) is intent judgement + slug naming.
 
@@ -2344,20 +2353,22 @@ function sanitizeSlug(raw) {
   let s = String(raw || '');
   try { s = s.normalize('NFKD'); } catch (_) { /* keep original on error */ }
   s = s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48).replace(/-+$/g, '');
-  return s || 'note';
+  return s || 'sketch';
 }
 
-function cmdQuick(values) {
+function cmdSketch(values) {
   if (!values.content || !String(values.content).trim()) {
-    console.error('usage: quick --content "<内容>" --slug "<slug>" [--root <dir>]');
+    console.error('usage: sketch --content "<内容>" --slug "<slug>"');
     return 1;
   }
+  // sketch always targets the user-level root ~/.mindmate; ignore --root / MMATE_ROOT.
+  ROOT_OVERRIDE = path.resolve(DEFAULT_CONTROL);
   const root = controlRoot();
-  const spacesRoot = resolveSpaces(values.spaces);
-  // Naked bootstrap check (quick skips probe): if the knowledge root is not
+  const spacesRoot = resolveSpaces();
+  // Naked bootstrap check (sketch skips probe): if the knowledge root is not
   // initialised there is nowhere to write; refuse early with a clear hint.
   if (!fs.existsSync(spacesRoot)) {
-    console.error('ERROR: 知识库未初始化（spaces/ 不存在）；请先 bootstrap / init --apply，再 quick。');
+    console.error('ERROR: 知识库未初始化（spaces/ 不存在）；请先 bootstrap / init --apply，再 sketch。');
     return 1;
   }
 
@@ -2372,50 +2383,51 @@ function cmdQuick(values) {
   const sign = off >= 0 ? '+' : '-';
   const offStr = `${sign}${String(Math.floor(Math.abs(off) / 60)).padStart(2, '0')}:${String(Math.abs(off) % 60).padStart(2, '0')}`;
 
-  // Collision: add -2, -3, ... to the whole pair so Source/Idea stay matched.
+  // Collision: add -2, -3, ... to the whole pair so Source/Sketch stay matched.
   const srcRel = (s) => `shelf/sources/${date}-${s}.md`;
-  const ideaRel = (s) => `spaces/inbox/concepts/${s}.md`;
+  const sketchRel = (s) => `spaces/inbox/concepts/${s}.md`;
   let finalSlug = slug, n = 2;
-  while (fs.existsSync(path.join(root, ideaRel(finalSlug))) || fs.existsSync(path.join(root, srcRel(finalSlug)))) {
+  while (fs.existsSync(path.join(root, sketchRel(finalSlug))) || fs.existsSync(path.join(root, srcRel(finalSlug)))) {
     finalSlug = `${slug}-${n++}`;
   }
   const run = `${stamp}-${finalSlug}`;
 
   const sourceContent = `---\ntype: Source\ntitle: 原始输入：${content.split('\n')[0].slice(0, 60)}\ndescription: 用户速记的原样输入\ngenerated: { by: human:user, at: ${iso}${offStr} }\n---\n\n${content}\n`;
-  const ideaTitle = content.split('\n')[0].slice(0, 60);
-  const ideaContent = `---\ntype: Idea\ntitle: ${ideaTitle}\ndescription: ${date} 速记的原样要点，未展开、无结论\nstatus: draft\ntags: [quick]\nsources:\n  - id: s1\n    resource: /shelf/sources/${date}-${finalSlug}.md\n---\n\n用户于 ${date} 速记以下要点，未展开、尚无结论；原文原样列于「待确认」，不做提炼。\n\n事实：原始输入包含以下 1 条要点。\n推断：无。\n\n## 待确认\n- ${content}\n\n## 出处\n[^s1]\n\n[^s1]: 原始输入见 shelf/sources/${date}-${finalSlug}.md。\n\n## 关联\n同主题文档暂无其它，待后续摄入补充。\n`;
+  const sketchTitle = content.split('\n')[0].slice(0, 60);
+  const sketchContent = `---\ntype: Sketch\ntitle: ${sketchTitle}\ndescription: ${date} 速记的原样要点，未展开、未整理\nstatus: draft\ntags: [sketch]\nsources:\n  - id: s1\n    resource: /shelf/sources/${date}-${finalSlug}.md\n---\n\n用户于 ${date} 速记以下要点，未展开、未整理、尚无结论；原文原样列于「待确认」，不做提炼、不分类。\n\n事实：原始输入包含以下 1 条要点。\n推断：无。\n\n## 待确认\n- ${content}\n\n## 出处\n[^s1]\n\n[^s1]: 原始输入见 shelf/sources/${date}-${finalSlug}.md。\n\n## 关联\n同主题文档暂无其它，待后续摄入补充。\n`;
 
   const manifest = {
     run,
     root,
     files: [
       { path: srcRel(finalSlug), content: sourceContent, action: 'create' },
-      { path: ideaRel(finalSlug), content: ideaContent, action: 'create' },
+      { path: sketchRel(finalSlug), content: sketchContent, action: 'create' },
     ],
     indexSpaces: ['inbox'],
     log: {
       space: 'inbox',
       date,
       entries: [
-        `- **Creation** 摄入 Source \`${srcRel(finalSlug)}\`（用户速记原样输入；写入全局根 \`~/.mindmate\`）`,
-        `- **Creation** 新建 Idea \`concepts/${finalSlug}.md\`（\`type: Idea\`、\`status: draft\`，\`## 待确认\` 原样列要点、尚无结论；出处 \`s1\` 指向上述同一 Source；quick 速记）`,
+        `- **Creation** 摄入 Source \`${srcRel(finalSlug)}\`（用户 sketch 速记的原样输入；写入全局根 \`~/.mindmate\`）`,
+        `- **Creation** 新建 Sketch \`concepts/${finalSlug}.md\`（\`type: Sketch\`、\`status: draft\`，\`## 待确认\` 原样列要点、未整理无结论；出处 \`s1\` 指向上述同一 Source）`,
       ],
     },
   };
 
-  emitTiming('capture:start');
   const mf = stagingPath(`${run}.json`);
   try { writeText(mf, JSON.stringify(manifest, null, 2)); }
   catch (e) { console.error(`ERROR: 写 manifest 失败: ${e.message}`); return 1; }
 
-  // Delegate all deterministic writes to stage-commit.
+  // Delegate all deterministic writes to stage-commit (fixed ~/.mindmate root).
   const rc = cmdStageCommit({ manifest: mf, apply: true, root });
   if (rc !== 0) return rc;
-  emitTiming('capture:end');
 
+  // Lint inside the same tool call — no extra LLM/tool round-trip.
+  const lintRc = cmdLint({ root });
+  const lintStatus = lintRc === 0 ? '0error/0warning' : 'HAS_ERRORS';
   // Fixed short report — LLM #2 turns this into one sentence.
-  console.log(`OK run=${run} files=2 space=inbox lint=pending paths=${srcRel(finalSlug)},${ideaRel(finalSlug)}`);
-  return 0;
+  console.log(`OK run=${run} files=2 space=inbox lint=${lintStatus} paths=${srcRel(finalSlug)},${sketchRel(finalSlug)}`);
+  return lintRc;
 }
 
 // ---------------------------------------------------------------- cli
@@ -2471,14 +2483,14 @@ function main() {
     case 'secret': return cmdSecret(values, positionals);
     case 'roots': return timed('roots', () => cmdRoots(values));
     case 'timing': return cmdTiming(values);
-    case 'stage-commit': return timed('stage-commit', () => cmdStageCommit(values));
-    case 'quick': return timed('quick', () => cmdQuick(values));
+    case 'stage-commit': return cmdStageCommit(values);
+    case 'sketch': return timed('sketch', () => cmdSketch(values));
     case 'probe': return cmdProbe(values);
     case 'promote': return cmdPromote(values, positionals);
     case 'repo-check': return cmdRepoCheck(values);
     case 'shelf': return cmdShelf(values);
     default:
-      console.error('usage: mindmate.mjs <init|init-project|space|move|index|lint|search|secret|roots|probe|timing|stage-commit|quick|promote|repo-check|shelf> [options]');
+      console.error('usage: mindmate.mjs <init|init-project|space|move|index|lint|search|secret|roots|probe|timing|stage-commit|sketch|promote|repo-check|shelf> [options]');
       console.error('  init [--apply]  |  init-project --project <repo-dir> [--roots shared|local|both] [--apply]');
       console.error('  space --list | --create <slug> | --rename <old> <new> | --delete <name>');
       console.error('  move --from <space> --to <space> --files <doc.md> [--files ...] [--apply]');
